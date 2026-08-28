@@ -1,0 +1,367 @@
+name: Build stable-diffusion.cpp packages
+
+on:
+  schedule:
+    # Deliberately far from the sibling builders, which dispatch into the same
+    # APT repository. whisper-cpp-deb runs Sunday 03:00 UTC and llama-cpp-deb
+    # Sunday 21:00 UTC. Two builders dispatching close together fail the second
+    # Pages deployment in li-ruijie/apt, after its packages are already built.
+    - cron: '0 9 * * 0'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream tag override, for example master-829-0a565f2."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even when the deployed version already matches"
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: leejet/stable-diffusion.cpp
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      cpu_asset: ${{ steps.resolve.outputs.cpu_asset }}
+      vulkan_asset: ${{ steps.resolve.outputs.vulkan_asset }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Resolve the upstream tag and decide whether to build
+        id: resolve
+        env:
+          TAG_OVERRIDE: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+
+          if [ -n "$TAG_OVERRIDE" ]; then
+            TAG="$TAG_OVERRIDE"
+          else
+            # Deliberately not releases/latest. Upstream cuts one release per
+            # push to master and two runs can finish out of order, so the API
+            # marks the older commit as latest. Observed on 2026-08-25, where
+            # master-830-50d6405 was published at 18:57:24 and
+            # master-829-0a565f2 at 18:59:09, and 829 was reported as latest
+            # while both carried the full nine assets. Taking latest would pin
+            # this repository to 0.0.829 and then never advance, since every
+            # later run would find the deployed version already matching.
+            TAG=$(gh api "repos/$UPSTREAM/releases?per_page=100" --jq '
+              [ .[]
+                | select(.tag_name | test("^master-[0-9]+-[0-9a-f]+$"))
+                | { tag: .tag_name,
+                    count: (.tag_name | split("-")[1] | tonumber) } ]
+              | sort_by(.count) | last | .tag')
+          fi
+
+          case "$TAG" in
+            master-*-*) ;;
+            *) echo "::error::$TAG is not a master-<count>-<sha> tag"; exit 1 ;;
+          esac
+
+          COUNT=$(printf '%s' "$TAG" | cut -d- -f2)
+          SHA=${TAG##*-}
+
+          case "$COUNT" in
+            ''|*[!0-9]*) echo "::error::no commit count in $TAG"; exit 1 ;;
+          esac
+
+          # Upstream publishes no semantic tag of any kind, so the commit count
+          # is the version. It comes from git rev-list --count HEAD in
+          # upstream's release job, so it is monotonic and 0.0.829 upgrades to
+          # 0.0.830 as apt expects.
+          VERSION="0.0.${COUNT}"
+
+          # Matched by pattern rather than exact name, since the Ubuntu version
+          # sits in the filename and moves when upstream's ubuntu-latest moves.
+          # An actual ABI change is caught by the floor assertion in the base
+          # job, which is the thing that matters.
+          assets=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name')
+          CPU_ASSET=$(printf '%s\n' "$assets" \
+            | grep -E 'bin-Linux-.*-x86_64\.zip$' | head -1)
+          VULKAN_ASSET=$(printf '%s\n' "$assets" \
+            | grep -E 'bin-Linux-.*-x86_64-vulkan\.zip$' | head -1)
+
+          # Asserted before anything is downloaded, so an incomplete release
+          # fails at the cheap end rather than after 79 MB has been fetched.
+          if [ -z "$CPU_ASSET" ] || [ -z "$VULKAN_ASSET" ]; then
+            echo "::error::$TAG does not carry both Linux archives"
+            printf '%s\n' "$assets"
+            exit 1
+          fi
+
+          echo "Upstream $TAG, commit $SHA, version $VERSION"
+          echo "  cpu    : $CPU_ASSET"
+          echo "  vulkan : $VULKAN_ASSET"
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+            echo "cpu_asset=$CPU_ASSET"
+            echo "vulkan_asset=$VULKAN_ASSET"
+          } >> "$GITHUB_OUTPUT"
+
+          # The range must anchor on ^Package: sd-cpp$, since sd-cpp-cuda and
+          # sd-cpp-vulkan both begin with that string and an unanchored match
+          # would read the wrong stanza.
+          DEPLOYED=$(curl -fsSL \
+            https://li-ruijie.github.io/apt/dists/stable/dynamic/binary-amd64/Packages \
+            2>/dev/null \
+            | awk '/^Package: sd-cpp$/,/^$/' \
+            | grep '^Version:' | awk '{print $2}' || true)
+
+          if [ "$VERSION" = "$DEPLOYED" ] && [ "$FORCE" != "true" ]; then
+            echo "Version $VERSION already deployed, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$VERSION" = "$DEPLOYED" ]; then
+            echo "Rebuilding $VERSION (forced)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version $VERSION (deployed: ${DEPLOYED:-none})"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Runs alongside the build jobs rather than gating them, and publish waits on
+  # the result. These suites were local-only in whisper-cpp-deb at first, which
+  # is how a missing mkdir reached CI rather than being caught on the desk.
+  test:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+
+      - name: Install what the suites need
+        run: sudo apt-get update && sudo apt-get install -y zip unzip
+
+      - name: Run every suite
+        run: |
+          status=0
+          for t in scripts/test/test-*.sh; do
+            echo "::group::$t"
+            bash "$t" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  base:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+
+      - name: Download the upstream CPU archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          ASSET: ${{ needs.check.outputs.cpu_asset }}
+        run: gh release download "$TAG" --repo "$UPSTREAM" --pattern "$ASSET" --dir .
+
+      - name: Assert the ABI floor has not risen
+        env:
+          ASSET: ${{ needs.check.outputs.cpu_asset }}
+        run: |
+          # Upstream builds on ubuntu-latest, so a runner image bump moves this
+          # floor with no announcement. 2.38 already excludes bookworm, and a
+          # move to 2.41 would exclude trixie too, which is the whole supported
+          # target. A rise fails the build. A fall is harmless and only means
+          # the declared Depends is stricter than it needs to be, so it is
+          # reported rather than treated as an error.
+          mkdir -p probe && unzip -qq "$ASSET" -d probe
+          highest() {
+            readelf -V probe/sd-cli | grep -oE "$1_[0-9.]+" | sort -uV | tail -1
+          }
+          glibc=$(highest GLIBC)
+          cxx=$(highest GLIBCXX)
+          echo "measured $glibc and $cxx"
+
+          exceeds() {
+            # true when $1 sorts strictly above $2
+            [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ] \
+              && [ "$1" != "$2" ]
+          }
+
+          fail=0
+          if exceeds "$glibc" GLIBC_2.38; then
+            echo "::error::glibc floor rose from GLIBC_2.38 to $glibc"
+            echo "Update Depends in package-base.sh and package-vulkan.sh, and"
+            echo "revisit which suites can run this at all."
+            fail=1
+          elif [ "$glibc" != "GLIBC_2.38" ]; then
+            echo "::notice::glibc floor fell to $glibc, Depends is now stricter than needed"
+          fi
+
+          if exceeds "$cxx" GLIBCXX_3.4.32; then
+            echo "::error::libstdc++ floor rose from GLIBCXX_3.4.32 to $cxx"
+            fail=1
+          elif [ "$cxx" != "GLIBCXX_3.4.32" ]; then
+            echo "::notice::libstdc++ floor fell to $cxx, Depends is stricter than needed"
+          fi
+
+          exit "$fail"
+
+      - name: Assert the declared runtime dependencies match the linkage
+        run: |
+          # Depends is derived from measurement, so it has to be rechecked
+          # against measurement or it silently goes stale. Everything the
+          # payload links beyond the bundled objects and the C and C++ runtimes
+          # must be covered by a Depends entry, and libgomp1 is the only one.
+          needed=$(for f in probe/*.so probe/*.so.* probe/sd-cli probe/sd-server; do
+                     [ -f "$f" ] || continue
+                     readelf -d "$f" 2>/dev/null \
+                       | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'
+                   done | sort -u)
+          printf '%s\n' "$needed" | sed 's/^/  /'
+
+          known='^(libstable-diffusion|libggml|libggml-base|libwebp|libwebpmux'
+          known="$known"'|libwebm|libsharpyuv|libc|libm|libdl|libpthread|librt'
+          known="$known"'|libstdc\+\+|libgcc_s|ld-linux-x86-64|libgomp)\.so'
+
+          unexpected=$(printf '%s\n' "$needed" | grep -vE "$known" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::the payload links libraries no Depends entry covers"
+            printf '%s\n' "$unexpected"
+            echo "Add the providing package to Depends in package-base.sh, then"
+            echo "add the soname to the known list here."
+            exit 1
+          fi
+
+          printf '%s\n' "$needed" | grep -q '^libgomp\.so' || {
+            echo "::error::libgomp is no longer linked, so Depends is stale"
+            exit 1; }
+          echo "every linked library is covered by Depends"
+
+      - name: Build sd-cpp
+        env:
+          ASSET: ${{ needs.check.outputs.cpu_asset }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: bash scripts/package-base.sh "$ASSET" "$VERSION" dist
+
+      - name: Smoke test
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          EXPECT_COMMIT: ${{ needs.check.outputs.sha }}
+        run: bash scripts/smoke-test.sh "dist/sd-cpp_${VERSION}_amd64.deb"
+
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: base
+          path: dist/*.deb
+          if-no-files-found: error
+
+  vulkan:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8   # v5.0.0
+
+      - name: Download both upstream archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          CPU_ASSET: ${{ needs.check.outputs.cpu_asset }}
+          VULKAN_ASSET: ${{ needs.check.outputs.vulkan_asset }}
+        run: |
+          # Both, since package-vulkan.sh proves they agree before taking one
+          # file out of one of them.
+          gh release download "$TAG" --repo "$UPSTREAM" \
+            --pattern "$CPU_ASSET" --pattern "$VULKAN_ASSET" --dir .
+
+      - name: Build sd-cpp and sd-cpp-vulkan
+        env:
+          CPU_ASSET: ${{ needs.check.outputs.cpu_asset }}
+          VULKAN_ASSET: ${{ needs.check.outputs.vulkan_asset }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # The base is rebuilt here rather than pulled from the base job, since
+          # the smoke test needs both packages and an artifact round trip costs
+          # more than an unzip.
+          bash scripts/package-base.sh   "$CPU_ASSET" "$VERSION" dist
+          bash scripts/package-vulkan.sh "$VULKAN_ASSET" "$CPU_ASSET" \
+                                         "$VERSION" dist
+
+      - name: Check the backend links nothing undeclared
+        run: |
+          mkdir -p probe && dpkg-deb -x dist/sd-cpp-vulkan_*.deb probe
+          bash scripts/check-backend-deps.sh \
+            probe/usr/lib/sd-cpp/libggml-vulkan.so vulkan
+
+      - name: Assert the backend declares the base library
+        run: |
+          # The unit suite cannot cover this, since no stand-in object it can
+          # build carries the entry. Asserted here against the real backend.
+          readelf -d probe/usr/lib/sd-cpp/libggml-vulkan.so \
+            | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' \
+            | grep -q '^libggml-base\.so' || {
+              echo "::error::the Vulkan backend does not declare libggml-base"
+              echo "It cannot be a ggml backend for the base package if it does"
+              echo "not link the base library."
+              exit 1; }
+          echo "the backend declares libggml-base"
+
+      - name: Install a Vulkan loader and a software device
+        run: |
+          # With no loader present ggml ignores the backend in silence, so this
+          # is what lets the smoke test assert anything at all. It also makes
+          # REQUIRE_FULL_LINKAGE satisfiable below.
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+
+      - name: Probe whether a software device is usable
+        id: probe
+        run: |
+          # Recorded rather than assumed. whisper-cpp-deb measured that Ubuntu
+          # 22.04's llvmpipe lacks storageBuffer16BitAccess, which
+          # ggml_vk_device_is_supported requires, so ggml discards a device
+          # vulkaninfo happily enumerates. This runner is 24.04 with a newer
+          # Mesa, so the answer may differ and is worth knowing either way.
+          vulkaninfo --summary 2>&1 | head -60 || true
+          if vulkaninfo 2>/dev/null | grep -qi 'storageBuffer16BitAccess.*= *true'; then
+            echo "a device advertises storageBuffer16BitAccess"
+            echo "usable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no device advertises storageBuffer16BitAccess"
+            echo "usable=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Smoke test
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          EXPECT_COMMIT: ${{ needs.check.outputs.sha }}
+          # The loader is installed above, so every library must resolve and an
+          # unjudgeable check becomes a failure rather than a silent skip.
+          REQUIRE_FULL_LINKAGE: '1'
+          # Asserted only where a usable device exists. Where none does, the
+          # test still proves the object resolves against the base and links
+          # nothing undeclared, which is the limit whisper-cpp-deb accepts too.
+          EXPECT_BACKEND: ${{ steps.probe.outputs.usable == 'true' && 'Vulkan' || '' }}
+        run: |
+          bash scripts/smoke-test.sh \
+            "dist/sd-cpp_${VERSION}_amd64.deb" \
+            "dist/sd-cpp-vulkan_${VERSION}_amd64.deb"
+
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
+        with:
+          name: vulkan
+          path: dist/sd-cpp-vulkan_*.deb
+          if-no-files-found: error
