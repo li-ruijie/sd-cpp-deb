@@ -643,6 +643,10 @@ jobs:
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job deliberately has no checkout, since it only needs the
+          # artifacts, so gh has no git remote to infer the repository from and
+          # fails with "not a git repository". GH_REPO supplies it directly.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.check.outputs.tag }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
