@@ -148,6 +148,21 @@ jobs:
       - name: Install what the suites need
         run: sudo apt-get update && sudo apt-get install -y zip unzip
 
+      - name: Assert every script is executable in git
+        run: |
+          # This filesystem is not the one that matters. Windows checkouts
+          # report every file as executable, so a script committed at 100644
+          # runs locally and fails on the runner with exit 126, "Permission
+          # denied". That happened twice before this check existed.
+          bad=$(git ls-files -s scripts/ | awk '$1 != "100755" {print $4}')
+          if [ -n "$bad" ]; then
+            echo "::error::these scripts are not mode 100755 in git"
+            printf '  %s\n' $bad
+            echo "Fix with: git update-index --chmod=+x <path>"
+            exit 1
+          fi
+          echo "all $(git ls-files scripts/ | wc -l) scripts are 100755"
+
       - name: Run every suite
         run: |
           status=0
@@ -516,3 +531,74 @@ jobs:
           name: cuda
           path: dist/sd-cpp-cuda_*.deb
           if-no-files-found: error
+
+  publish:
+    needs: [check, test, base, vulkan, cuda]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Check all three packages arrived
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # An artifact that silently failed to upload would otherwise produce
+          # a release missing a package, and a dispatch naming a URL that 404s.
+          missing=0
+          for p in sd-cpp sd-cpp-vulkan sd-cpp-cuda; do
+            f="artifacts/${p}_${VERSION}_amd64.deb"
+            if [ -f "$f" ]; then
+              printf '  %-28s %10d bytes\n' "$p" "$(stat -c %s "$f")"
+            else
+              echo "::error::missing $f"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # The tag mirrors upstream verbatim and is not semantic, matching
+          # llama-cpp-deb, which released b10453 and b10333 before llama.cpp
+          # went semantic. Title follows the sibling form.
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" \
+                 --title "stable-diffusion.cpp $TAG" \
+                 --notes "Packaged as $VERSION for https://li-ruijie.github.io/apt/"
+          # --clobber rather than deleting the release first. Deleting left a
+          # window, roughly the length of the upload, in which a failure lost
+          # both the old release and the new one, and took the tag with them.
+          # That is recorded in whisper-cpp-deb.
+          gh release upload "$TAG" artifacts/*.deb --clobber
+
+      - name: Add the packages to the APT repository
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          BASE="https://github.com/li-ruijie/sd-cpp-deb/releases/download/$TAG"
+          # The apt workflow fetches these anonymously, which is why this
+          # repository has to stay public.
+          jq -n --arg b "$BASE" --arg v "$VERSION" '{
+            event_type: "add-debs",
+            client_payload: {
+              debs: [
+                "\($b)/sd-cpp_\($v)_amd64.deb",
+                "\($b)/sd-cpp-vulkan_\($v)_amd64.deb",
+                "\($b)/sd-cpp-cuda_\($v)_amd64.deb"
+              ]
+            }
+          }' | gh api repos/li-ruijie/apt/dispatches -X POST --input -
+          echo "dispatched $VERSION to li-ruijie/apt"
