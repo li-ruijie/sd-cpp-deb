@@ -25,6 +25,14 @@ concurrency:
   group: build
   cancel-in-progress: false
 
+# Set workflow-wide rather than on the one job that needs it. A container job
+# defaults to sh, which is dash here, where mapfile, process substitution, and
+# ${var//a/b} are all syntax errors. That failed the cuda job after a
+# half-hour compile had already succeeded, at a step that reads one filename.
+defaults:
+  run:
+    shell: bash
+
 env:
   UPSTREAM: leejet/stable-diffusion.cpp
 
@@ -393,8 +401,12 @@ jobs:
           # Before checkout, which needs git present or it falls back to a REST
           # download. No sudo: a container job already runs as root.
           apt-get update
+          # diffutils supplies cmp, which package-base.sh uses to prove the
+          # duplicate library copies really are identical before collapsing
+          # them to symlinks. dpkg supplies dpkg-deb.
           apt-get install -y --no-install-recommends \
-            build-essential git ca-certificates curl unzip xz-utils
+            build-essential git ca-certificates curl unzip xz-utils \
+            diffutils dpkg
 
       - name: Checkout this repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
@@ -409,10 +421,22 @@ jobs:
           tar xzf cmake.tar.gz
           echo "$PWD/cmake-3.31.12-linux-x86_64/bin" >> "$GITHUB_PATH"
 
-      - name: Report the toolchain
+      - name: Report the toolchain and check the driver stubs exist
         run: |
           cmake --version | head -1
           nvcc --version | tail -2
+          # The smoke test feeds this to LD_LIBRARY_PATH so libcuda.so.1
+          # resolves without a real driver. With REQUIRE_FULL_LINKAGE set, a
+          # wrong path here would surface as an unresolved library at the very
+          # end of a long job, so it is checked before the compile instead.
+          stubs=/usr/local/cuda/lib64/stubs
+          if [ ! -e "$stubs/libcuda.so" ]; then
+            echo "::error::no libcuda.so under $stubs"
+            find /usr/local/cuda -name 'libcuda.so*' 2>/dev/null | head
+            exit 1
+          fi
+          echo "driver stubs present at $stubs"
+          ls "$stubs"
 
       - name: Check out upstream at the resolved tag
         env:
@@ -508,14 +532,28 @@ jobs:
             "https://github.com/leejet/stable-diffusion.cpp/releases/download/$TAG/$ASSET"
           bash scripts/package-base.sh "$ASSET" "$VERSION" dist
 
+      - name: Build a driver stub directory carrying the soname
+        run: |
+          # NVIDIA ships libcuda.so in its stubs directory, with no libcuda.so.1
+          # beside it, and the soname is what the loader asks for. Pointing
+          # LD_LIBRARY_PATH straight at the stubs therefore still leaves
+          # libcuda.so.1 unresolved, which REQUIRE_FULL_LINKAGE below would
+          # correctly fail on. A directory carrying the soname is assembled
+          # here instead.
+          mkdir -p "$GITHUB_WORKSPACE/stubs"
+          cp /usr/local/cuda/lib64/stubs/libcuda.so "$GITHUB_WORKSPACE/stubs/libcuda.so.1"
+          ls -l "$GITHUB_WORKSPACE/stubs"
+
       - name: Smoke test
         env:
           VERSION: ${{ needs.check.outputs.version }}
           EXPECT_COMMIT: ${{ needs.check.outputs.sha }}
-          # The stub directory supplies libcuda.so.1 in place of a real driver,
-          # so every library resolves and the undefined-symbol verdict can be
-          # reached rather than skipped.
-          BACKEND_STUB_DIR: /usr/local/cuda/lib64/stubs
+          # Two directories, colon joined, since the smoke test appends this to
+          # LD_LIBRARY_PATH verbatim. The first supplies libcuda.so.1 in place
+          # of a real driver, and the second the real libcudart and libcublas
+          # the backend links, so every library resolves and the
+          # undefined-symbol verdict can be reached rather than skipped.
+          BACKEND_STUB_DIR: ${{ github.workspace }}/stubs:/usr/local/cuda/lib64
           REQUIRE_FULL_LINKAGE: '1'
           # EXPECT_BACKEND is deliberately unset. This runner has no NVIDIA
           # hardware, so no CUDA device can ever be listed. The smoke test still
