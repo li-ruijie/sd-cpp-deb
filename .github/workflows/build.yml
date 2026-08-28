@@ -326,22 +326,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
 
-      - name: Probe whether a software device is usable
-        id: probe
+      - name: Record what the software rasteriser offers
         run: |
-          # Recorded rather than assumed. whisper-cpp-deb measured that Ubuntu
-          # 22.04's llvmpipe lacks storageBuffer16BitAccess, which
-          # ggml_vk_device_is_supported requires, so ggml discards a device
-          # vulkaninfo happily enumerates. This runner is 24.04 with a newer
-          # Mesa, so the answer may differ and is worth knowing either way.
-          vulkaninfo --summary 2>&1 | head -60 || true
-          if vulkaninfo 2>/dev/null | grep -qi 'storageBuffer16BitAccess.*= *true'; then
-            echo "a device advertises storageBuffer16BitAccess"
-            echo "usable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "no device advertises storageBuffer16BitAccess"
-            echo "usable=false" >> "$GITHUB_OUTPUT"
-          fi
+          # Kept for the record rather than to decide anything. An earlier
+          # version of this job gated the device assertion on
+          # storageBuffer16BitAccess, following the measurement in
+          # whisper-cpp-deb that Ubuntu 22.04's llvmpipe lacks it. On 24.04
+          # lavapipe advertises it and ggml still reports "No devices found",
+          # so that capability is necessary and not sufficient, and no property
+          # read out of vulkaninfo can stand in for asking ggml itself.
+          vulkaninfo --summary 2>&1 | head -40 || true
 
       - name: Smoke test
         env:
@@ -350,10 +344,11 @@ jobs:
           # The loader is installed above, so every library must resolve and an
           # unjudgeable check becomes a failure rather than a silent skip.
           REQUIRE_FULL_LINKAGE: '1'
-          # Asserted only where a usable device exists. Where none does, the
-          # test still proves the object resolves against the base and links
-          # nothing undeclared, which is the limit whisper-cpp-deb accepts too.
-          EXPECT_BACKEND: ${{ steps.probe.outputs.usable == 'true' && 'Vulkan' || '' }}
+          # EXPECT_BACKEND is deliberately unset. These runners have no GPU and
+          # lavapipe is rejected by ggml, so no Vulkan device can ever be
+          # listed and asserting one would fail every run for an environmental
+          # reason. The smoke test still asserts that ggml dlopened the
+          # backend, which is the stronger half and does hold here.
         run: |
           bash scripts/smoke-test.sh \
             "dist/sd-cpp_${VERSION}_amd64.deb" \

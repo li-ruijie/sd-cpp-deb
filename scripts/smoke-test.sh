@@ -158,6 +158,29 @@ echo "== sd-cli --list-devices =="
 devices_out=$("$bin/sd-cli" --list-devices 2>&1)
 printf '%s\n' "$devices_out"
 
+# Two separate facts, and conflating them cost a build. ggml announces every
+# backend it dlopens on a load_backend line, whether or not that backend then
+# finds a device it can use. So loading is provable on any runner, and device
+# usability is provable only where a usable device exists.
+#
+# Measured on 2026-08-28 on ubuntu-latest: lavapipe (Mesa 25.2.8, LLVM 20.1.2)
+# advertises storageBuffer16BitAccess, yet ggml still reports "No devices
+# found" while having loaded the backend. That capability is necessary and not
+# sufficient, so no property of the device can stand in for asking ggml.
+if [ "$#" -eq 2 ]; then
+    echo "== confirming ggml loaded $backend =="
+    if printf '%s\n' "$devices_out" | grep -q "load_backend: loaded .* from $tree/$backend"; then
+        printf 'found: %s\n' \
+            "$(printf '%s\n' "$devices_out" | grep "from $tree/$backend")"
+    else
+        echo "ggml never loaded $backend" >&2
+        echo "The object is in the tree and resolves, so this means ggml" >&2
+        echo "rejected it at dlopen time rather than simply finding no" >&2
+        echo "device, which a load_backend line would still report." >&2
+        status=1
+    fi
+fi
+
 if [ -n "${EXPECT_BACKEND:-}" ]; then
     echo "== confirming ggml selected the $EXPECT_BACKEND backend =="
     if printf '%s\n' "$devices_out" | grep -qi "^${EXPECT_BACKEND}"; then
@@ -165,9 +188,11 @@ if [ -n "${EXPECT_BACKEND:-}" ]; then
             "$(printf '%s\n' "$devices_out" | grep -i "^${EXPECT_BACKEND}")"
     else
         echo "no $EXPECT_BACKEND device was listed, so ggml fell back to CPU" >&2
-        echo "A backend whose loader or driver is missing is ignored in" >&2
-        echo "silence, producing output identical to a run without it, which" >&2
-        echo "is exactly what this assertion exists to catch." >&2
+        echo "A backend whose driver is missing or whose devices are all" >&2
+        echo "unusable leaves no trace in the device list, producing output" >&2
+        echo "indistinguishable from a CPU-only run, which is exactly what" >&2
+        echo "this assertion exists to catch. Set EXPECT_BACKEND only where a" >&2
+        echo "usable device genuinely exists, meaning on real hardware." >&2
         status=1
     fi
 fi
