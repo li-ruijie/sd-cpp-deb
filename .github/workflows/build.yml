@@ -360,3 +360,159 @@ jobs:
           name: vulkan
           path: dist/sd-cpp-vulkan_*.deb
           if-no-files-found: error
+
+  cuda:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    container:
+      # 13.3 rather than upstream's 12.6.3, so the runtime dependency matches
+      # llama-cpp-cuda and whisper-cpp-cuda and one NVIDIA apt configuration
+      # serves all three. 24.04 rather than the siblings' 22.04, since the base
+      # package already sits at a GLIBC_2.38 floor, so there is nothing lower
+      # left to hold here.
+      image: nvidia/cuda:13.3.1-devel-ubuntu24.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          # Before checkout, which needs git present or it falls back to a REST
+          # download. No sudo: a container job already runs as root.
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git ca-certificates curl unzip xz-utils
+
+      - name: Checkout this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Fetch CMake 3.31.12
+        run: |
+          # The container ships a CMake that predates CMAKE_CUDA_ARCHITECTURES
+          # accepting a 120a value. Fetched rather than trusted, since the cost
+          # is small and the failure would be a build error late in a long job.
+          curl -fsSL -o cmake.tar.gz \
+            https://github.com/Kitware/CMake/releases/download/v3.31.12/cmake-3.31.12-linux-x86_64.tar.gz
+          tar xzf cmake.tar.gz
+          echo "$PWD/cmake-3.31.12-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Report the toolchain
+        run: |
+          cmake --version | head -1
+          nvcc --version | tail -2
+
+      - name: Check out upstream at the resolved tag
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          # The exact tag, not master. The backend must be ABI-compatible with
+          # the base package, which comes from this same release.
+          git clone --depth 1 --branch "$TAG" --recursive \
+            https://github.com/leejet/stable-diffusion.cpp.git upstream
+
+      - name: Compile the CUDA backend
+        working-directory: upstream
+        run: |
+          # SD_BUILD_EXAMPLES=OFF is the deliberate departure from upstream's
+          # Dockerfile.cuda. This job wants libggml-cuda.so alone, and turning
+          # the examples off also removes upstream's Node and pnpm requirement,
+          # which exists solely to embed the sd-server web UI. The base package
+          # already carries upstream's own build of both executables.
+          #
+          # GGML_CUDA_NCCL must stay OFF. It defaults on and this container
+          # ships NCCL, so CMake would link libnccl.so.2 into the backend.
+          # Target machines have no NCCL, so the backend would fail to dlopen
+          # and ggml would fall back to CPU without saying why. That fault
+          # reached llama-cpp-deb once already, and was found by reading a
+          # passing smoke test's output rather than by any failure.
+          cmake -B build \
+            -DSD_CUDA=ON \
+            -DSD_BUILD_EXAMPLES=OFF \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DSD_BUILD_SHARED_GGML_LIB=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_CUDA_ARCHITECTURES="89-real;120a-real;90-virtual"
+          cmake --build build --config Release -j"$(nproc)"
+
+      - name: Locate the backend
+        id: backend
+        run: |
+          # find rather than a fixed path, since the tree layout is upstream's
+          # to change. More than one match would be ambiguous, so it is an
+          # error rather than a silent first-wins.
+          mapfile -t found < <(find upstream/build -name 'libggml-cuda.so' -type f)
+          printf 'found %s:\n' "${#found[@]}"
+          printf '  %s\n' "${found[@]}"
+          if [ "${#found[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one libggml-cuda.so, found ${#found[@]}"
+            exit 1
+          fi
+          echo "path=${found[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive the CUDA suffix from nvcc
+        id: cuda
+        run: |
+          # Derived rather than hardcoded, so a container bump moves the
+          # declared dependency with it rather than leaving it stale.
+          ver=$(nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
+          [ -n "$ver" ] || { echo "::error::could not read a version from nvcc"; exit 1; }
+          echo "nvcc reports $ver"
+          echo "suffix=${ver//./-}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the backend links nothing undeclared
+        run: bash scripts/check-backend-deps.sh "${{ steps.backend.outputs.path }}" cuda
+
+      - name: Assert the backend declares the base library
+        run: |
+          readelf -d "${{ steps.backend.outputs.path }}" \
+            | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' \
+            | grep -q '^libggml-base\.so' || {
+              echo "::error::the CUDA backend does not declare libggml-base"
+              exit 1; }
+          echo "the backend declares libggml-base"
+
+      - name: Build sd-cpp-cuda
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          SUFFIX: ${{ steps.cuda.outputs.suffix }}
+        run: |
+          bash scripts/package-cuda.sh \
+            "${{ steps.backend.outputs.path }}" "$VERSION" "$SUFFIX" dist
+
+      - name: Rebuild the base package for the smoke test
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          ASSET: ${{ needs.check.outputs.cpu_asset }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          curl -fsSL -o "$ASSET" \
+            "https://github.com/leejet/stable-diffusion.cpp/releases/download/$TAG/$ASSET"
+          bash scripts/package-base.sh "$ASSET" "$VERSION" dist
+
+      - name: Smoke test
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          EXPECT_COMMIT: ${{ needs.check.outputs.sha }}
+          # The stub directory supplies libcuda.so.1 in place of a real driver,
+          # so every library resolves and the undefined-symbol verdict can be
+          # reached rather than skipped.
+          BACKEND_STUB_DIR: /usr/local/cuda/lib64/stubs
+          REQUIRE_FULL_LINKAGE: '1'
+          # EXPECT_BACKEND is deliberately unset. This runner has no NVIDIA
+          # hardware, so no CUDA device can ever be listed. The smoke test still
+          # asserts that ggml dlopened the backend, which does hold here.
+        run: |
+          bash scripts/smoke-test.sh \
+            "dist/sd-cpp_${VERSION}_amd64.deb" \
+            "dist/sd-cpp-cuda_${VERSION}_amd64.deb"
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: cuda
+          path: dist/sd-cpp-cuda_*.deb
+          if-no-files-found: error
