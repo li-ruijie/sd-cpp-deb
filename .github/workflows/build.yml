@@ -406,7 +406,7 @@ jobs:
           # them to symlinks. dpkg supplies dpkg-deb.
           apt-get install -y --no-install-recommends \
             build-essential git ca-certificates curl unzip xz-utils \
-            diffutils dpkg
+            diffutils dpkg ccache
 
       - name: Checkout this repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
@@ -447,6 +447,36 @@ jobs:
           git clone --depth 1 --branch "$TAG" --recursive \
             https://github.com/leejet/stable-diffusion.cpp.git upstream
 
+      - name: Restore the compiler cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25   # v5.1.0
+        with:
+          # Under the workspace rather than somewhere like /ccache. The
+          # workspace is bind-mounted into the container, so both the cache
+          # action and the compiler see the same directory. A container-only
+          # path is the most likely way for this to silently cache nothing.
+          path: ${{ github.workspace }}/.ccache
+          # The exact key changes on every upstream tag, so restore-keys is the
+          # load-bearing half. Without the prefix fallback the cache would never
+          # be reused and this would achieve nothing.
+          key: ccache-cuda13.3-${{ needs.check.outputs.tag }}
+          restore-keys: |
+            ccache-cuda13.3-
+
+      - name: Configure ccache
+        run: |
+          # ggml finds ccache on PATH by itself, so no CMake flag changes.
+          {
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
+            echo "CCACHE_MAXSIZE=2G"
+            # Hash the compiler rather than trust its mtime, so a container
+            # image bump invalidates the cache instead of silently reusing
+            # objects built by a different nvcc.
+            echo "CCACHE_COMPILERCHECK=content"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/.ccache"
+          ccache --zero-stats
+          ccache --version | head -1
+
       - name: Compile the CUDA backend
         working-directory: upstream
         run: |
@@ -476,6 +506,15 @@ jobs:
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_CUDA_ARCHITECTURES="89-real;120a-real;90-virtual"
           cmake --build build --config Release -j"$(nproc)"
+
+      - name: Report the compiler cache
+        run: |
+          # Printed rather than merely relied upon. A cache that has quietly
+          # stopped working shows up here as a hit rate near zero, where
+          # otherwise it would only ever look like a slow build.
+          ccache --show-stats
+          printf 'cache directory holds %s\n' \
+            "$(du -sh "$GITHUB_WORKSPACE/.ccache" 2>/dev/null | cut -f1)"
 
       - name: Locate the backend
         id: backend
