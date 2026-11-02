@@ -114,6 +114,28 @@ check "exit status on an unknown binary" "$?" "1"
 printf '%s' "$out" | grep -q 'sd-bench' \
     && ok "names the unrecognised binary" || bad "names the unrecognised binary"
 
+echo "== upstream's launcher scripts are left out =="
+# Since master-982 the archive carries these. They locate sd-server and a
+# models directory relative to themselves, which suits an unpacked folder and
+# not /usr/lib/sd-cpp.
+zip8="$work/launchers.zip"
+make_zip "$zip8"
+l=$(mktemp -d)
+printf '#!/bin/sh\n' > "$l/start-server.sh"; chmod 755 "$l/start-server.sh"
+printf '@echo off\r\n' > "$l/start-server.bat"
+( cd "$l" && zip -qg "$zip8" start-server.sh start-server.bat ); rm -rf "$l"
+deb8=$("$script" "$zip8" 0.0.829 "$work/out8" 2>"$work/err8")
+rc=$?
+check "exit status with the launchers present" "$rc" "0"
+[ "$rc" -eq 0 ] || sed 's/^/       /' "$work/err8"
+if [ -f "$deb8" ]; then
+    dpkg-deb -c "$deb8" | grep -q 'start-server' \
+        && bad "launchers left out of the package" \
+        || ok "launchers left out of the package"
+else
+    bad "launchers left out of the package"
+fi
+
 echo "== a missing expected tool fails the build =="
 zip3="$work/missing.zip"
 make_zip "$zip3"

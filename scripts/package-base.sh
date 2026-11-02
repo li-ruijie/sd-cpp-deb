@@ -27,6 +27,12 @@ esac
 # Upstream has already renamed this tool once, from sd to sd-cli.
 tools="sd-cli sd-server"
 
+# Launchers for an unpacked folder, shipped since master-982. Each looks for
+# sd-server, a models directory, and a local config beside itself, which here
+# would be /usr/lib/sd-cpp, and the .bat is for Windows. Removed by name so the
+# check below still catches anything else new.
+launchers="start-server.sh start-server.bat"
+
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 
@@ -44,6 +50,10 @@ chmod 0755 "$root/DEBIAN"
 
 # Upstream's zip stores every file at the top level, with no wrapping directory.
 unzip -qq "$archive" -d "$libdir"
+
+for name in $launchers; do
+    rm -f "$libdir/$name"
+done
 
 # The licence texts are documentation rather than payload. Both are required:
 # a missing one means upstream changed the archive, and distributing the
