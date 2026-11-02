@@ -75,7 +75,7 @@ BSD-3-Clause, and SageAttention, under Apache-2.0, and `sd-cpp-cuda` ships both 
 ## Tests
 
 Every suite runs in CI on each build, and locally under WSL. They need `bash`, `dpkg-deb`, `zip`,
-`unzip`, and `gcc`, with no network access.
+`unzip`, and `readelf`, with no compiler and no network access.
 
 ```sh
 for t in scripts/test/test-*.sh; do bash "$t" || echo "FAILED $t"; done
