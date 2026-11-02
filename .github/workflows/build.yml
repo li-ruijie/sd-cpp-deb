@@ -409,10 +409,12 @@ jobs:
           apt-get update
           # diffutils supplies cmp, which package-base.sh uses to prove the
           # duplicate library copies really are identical before collapsing
-          # them to symlinks. dpkg supplies dpkg-deb.
+          # them to symlinks. dpkg supplies dpkg-deb. The Vulkan headers and
+          # glslc are what upstream's own Linux Vulkan job installs, needed here
+          # since the library is built with SD_VULKAN as well.
           apt-get install -y --no-install-recommends \
             build-essential git ca-certificates curl unzip xz-utils \
-            diffutils dpkg ccache
+            diffutils dpkg ccache libvulkan-dev glslc spirv-headers
 
       - name: Checkout this repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
@@ -449,8 +451,10 @@ jobs:
           TAG: ${{ needs.check.outputs.tag }}
         run: |
           # The exact tag, not master. The backend must be ABI-compatible with
-          # the base package, which comes from this same release.
-          git clone --depth 1 --branch "$TAG" --recursive \
+          # the base package, which comes from this same release. Recursive,
+          # since the library compiles in CUTLASS from thirdparty/cutlass, and
+          # shallow throughout, since CUTLASS history is large.
+          git clone --depth 1 --branch "$TAG" --recursive --shallow-submodules \
             https://github.com/leejet/stable-diffusion.cpp.git upstream
 
       - name: Restore the compiler cache
@@ -483,14 +487,22 @@ jobs:
           ccache --zero-stats
           ccache --version | head -1
 
-      - name: Compile the CUDA backend
+      - name: Compile the CUDA backend and library
         working-directory: upstream
         run: |
           # SD_BUILD_EXAMPLES=OFF is the deliberate departure from upstream's
-          # Dockerfile.cuda. This job wants libggml-cuda.so alone, and turning
-          # the examples off also removes upstream's Node and pnpm requirement,
-          # which exists solely to embed the sd-server web UI. The base package
-          # already carries upstream's own build of both executables.
+          # Dockerfile.cuda. This job wants libggml-cuda.so and
+          # libstable-diffusion.so, and turning the examples off also removes
+          # upstream's Node and pnpm requirement, which exists solely to embed
+          # the sd-server web UI. The base package already carries upstream's
+          # own build of both executables.
+          #
+          # From master-1037 the CUDA kernels for RoPE, INT8, and attention are
+          # compiled into libstable-diffusion.so, and sd-cpp-cuda replaces the
+          # base copy with this build. SD_VULKAN is on as well, so the Vulkan
+          # kernels the base copy carries survive the replacement. It also
+          # compiles a libggml-vulkan.so, which is discarded, since
+          # sd-cpp-vulkan ships upstream's.
           #
           # GGML_CUDA_NCCL must stay OFF. It defaults on and this container
           # ships NCCL, so CMake would link libnccl.so.2 into the backend.
@@ -500,6 +512,7 @@ jobs:
           # passing smoke test's output rather than by any failure.
           cmake -B build \
             -DSD_CUDA=ON \
+            -DSD_VULKAN=ON \
             -DSD_BUILD_EXAMPLES=OFF \
             -DSD_BUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF \
@@ -528,14 +541,17 @@ jobs:
           # find rather than a fixed path, since the tree layout is upstream's
           # to change. More than one match would be ambiguous, so it is an
           # error rather than a silent first-wins.
-          mapfile -t found < <(find upstream/build -name 'libggml-cuda.so' -type f)
-          printf 'found %s:\n' "${#found[@]}"
-          printf '  %s\n' "${found[@]}"
-          if [ "${#found[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one libggml-cuda.so, found ${#found[@]}"
-            exit 1
-          fi
-          echo "path=${found[0]}" >> "$GITHUB_OUTPUT"
+          for pair in path:libggml-cuda.so library:libstable-diffusion.so; do
+            key=${pair%%:*} name=${pair#*:}
+            mapfile -t found < <(find upstream/build -name "$name" -type f)
+            printf 'found %s %s:\n' "${#found[@]}" "$name"
+            printf '  %s\n' "${found[@]}"
+            if [ "${#found[@]}" -ne 1 ]; then
+              echo "::error::expected exactly one $name, found ${#found[@]}"
+              exit 1
+            fi
+            echo "$key=${found[0]}" >> "$GITHUB_OUTPUT"
+          done
 
       - name: Derive the CUDA suffix from nvcc
         id: cuda
@@ -549,6 +565,26 @@ jobs:
 
       - name: Check the backend links nothing undeclared
         run: bash scripts/check-backend-deps.sh "${{ steps.backend.outputs.path }}" cuda
+
+      - name: Check the library links nothing undeclared
+        env:
+          LIBRARY: ${{ steps.backend.outputs.library }}
+        run: |
+          # Printed in full first, for the record, as with every other object.
+          needed=$(readelf -d "$LIBRARY" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p')
+          printf '%s\n' "$needed" | sed 's/^/  /'
+          bash scripts/check-backend-deps.sh "$LIBRARY" cuda
+          # The Vulkan kernels reach the loader through ggml's extension
+          # service rather than by linking it, as in upstream's own Vulkan
+          # build, and sd-cpp-cuda declares no libvulkan1.
+          if printf '%s\n' "$needed" | grep -q '^libvulkan'; then
+            echo "::error::the library links the Vulkan loader, which sd-cpp-cuda does not declare"
+            exit 1
+          fi
+          printf '%s\n' "$needed" | grep -q '^libggml-base\.so' || {
+            echo "::error::the library does not declare libggml-base"
+            exit 1; }
+          echo "the library links only declared objects"
 
       - name: Assert the backend declares the base library
         run: |
@@ -565,7 +601,8 @@ jobs:
           SUFFIX: ${{ steps.cuda.outputs.suffix }}
         run: |
           bash scripts/package-cuda.sh \
-            "${{ steps.backend.outputs.path }}" "$VERSION" "$SUFFIX" dist
+            "${{ steps.backend.outputs.path }}" "${{ steps.backend.outputs.library }}" \
+            upstream "$VERSION" "$SUFFIX" dist
 
       - name: Rebuild the base package for the smoke test
         env:
@@ -607,6 +644,46 @@ jobs:
           bash scripts/smoke-test.sh \
             "dist/sd-cpp_${VERSION}_amd64.deb" \
             "dist/sd-cpp-cuda_${VERSION}_amd64.deb"
+
+      - name: Install and remove both packages, checking the diversion
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          EXPECT_COMMIT: ${{ needs.check.outputs.sha }}
+          ASSET: ${{ needs.check.outputs.vulkan_asset }}
+          LIBRARY: ${{ steps.backend.outputs.library }}
+        run: |
+          # The maintainer scripts only run under dpkg, and this container runs
+          # as root with the CUDA runtime packages installed, so the diversion
+          # is exercised for real rather than read out of the scripts.
+          set -euo pipefail
+          lib=/usr/lib/sd-cpp/libstable-diffusion.so
+          unzip -p "$ASSET" libstable-diffusion.so > base-library.so
+          fail() { echo "::error::$*"; exit 1; }
+
+          dpkg -i "dist/sd-cpp_${VERSION}_amd64.deb" "dist/sd-cpp-cuda_${VERSION}_amd64.deb"
+          dpkg-divert --list "$lib"
+          [ "$(dpkg-divert --truename "$lib")" = "$lib.distrib" ] \
+            || fail "the library is not diverted"
+          cmp -s "$lib" "$LIBRARY" || fail "the CUDA library is not in place"
+          cmp -s "$lib.distrib" base-library.so || fail "the base copy was not moved aside"
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/stubs:/usr/local/cuda/lib64" \
+            sd-cli --version | tee version.txt
+          grep -q "$EXPECT_COMMIT" version.txt || fail "the installed sd-cli does not run"
+
+          # A base upgrade while diverted must land beside, not over, the CUDA
+          # copy. Reinstalling the same version takes that path.
+          dpkg -i "dist/sd-cpp_${VERSION}_amd64.deb"
+          cmp -s "$lib" "$LIBRARY" || fail "reinstalling sd-cpp overwrote the CUDA library"
+          cmp -s "$lib.distrib" base-library.so || fail "reinstalling sd-cpp lost the base copy"
+
+          dpkg -r sd-cpp-cuda
+          [ -z "$(dpkg-divert --list "$lib")" ] || fail "the diversion outlived sd-cpp-cuda"
+          [ ! -e "$lib.distrib" ] || fail "the diverted copy was left behind"
+          cmp -s "$lib" base-library.so || fail "removal did not restore the base library"
+
+          dpkg -r sd-cpp
+          [ ! -e "$lib" ] || fail "the library outlived both packages"
+          echo "install, reinstall, and removal all left the library where expected"
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2

@@ -5,7 +5,10 @@ Builds `sd-cpp`, `sd-cpp-vulkan`, and `sd-cpp-cuda` for
 [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
 
 `sd-cpp` carries `sd-cli` and `sd-server`, repackaged from the upstream Linux release archive.
-The two backend packages each add one ggml shared object, and both may be installed together.
+`sd-cpp-vulkan` adds one ggml shared object. `sd-cpp-cuda` adds the CUDA backend and also replaces
+`libstable-diffusion.so` with a CUDA build, through a `dpkg-divert` that removing the package
+undoes, since upstream compiles its CUDA kernels for RoPE, INT8, and attention into that library.
+Both backend packages may be installed together.
 
 ## Requirements
 
@@ -36,6 +39,11 @@ sd-cli --list-devices
 
 A CPU entry alone means no GPU backend loaded. Select between backends with `--backend`.
 
+`sd-cpp-cuda` is the exception to that silence. Its build of `libstable-diffusion.so` links the
+NVIDIA driver library `libcuda.so.1` directly, so on a machine without the driver `sd-cli` and
+`sd-server` refuse to start with a loader error naming that library. Removing `sd-cpp-cuda`
+returns them to the CPU.
+
 ## Models
 
 None are included and none are downloaded at install time. They run to several gigabytes and come
@@ -45,9 +53,10 @@ same APT repository covers the Hugging Face half.
 ## Building
 
 The whole build runs in GitHub Actions, weekly on Sunday at 09:00 UTC and on demand. Only the CUDA
-backend is compiled. The base package repackages upstream's prebuilt Linux archive, and the Vulkan
-package extracts one shared object from upstream's prebuilt Vulkan archive after asserting that
-archive is otherwise byte-identical to the CPU one.
+package is compiled, both its backend and its `libstable-diffusion.so`. The base and Vulkan packages
+divide upstream's prebuilt Vulkan archive between them, after asserting that the archive matches
+the CPU one except for the backend and `libstable-diffusion.so`, whose Vulkan kernels register
+nothing without a Vulkan device.
 
 ## Licensing
 
@@ -59,7 +68,9 @@ matching the sibling builders and the APT repository itself. See `LICENSE`.
 The packaged software is upstream's and stays under upstream's terms, which are MIT for
 stable-diffusion.cpp and for ggml. Those texts ship inside every `sd-cpp` package at
 `/usr/share/doc/sd-cpp/`, taken from the release archive rather than copied here, so they can never
-drift from the build they describe.
+drift from the build they describe. The CUDA build of the library also compiles in CUTLASS, under
+BSD-3-Clause, and SageAttention, under Apache-2.0, and `sd-cpp-cuda` ships both texts at
+`/usr/share/doc/sd-cpp-cuda/`, taken from the source tree it was built from.
 
 ## Tests
 

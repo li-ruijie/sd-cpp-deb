@@ -194,6 +194,27 @@ printf '%s' "$out" | grep -q 'resolved to the base package' \
     && bad "claimed a base link the stand-in does not have" \
     || ok "does not claim a base link that is absent"
 
+echo "== a library shipped with the backend is resolved as well =="
+# sd-cpp-cuda replaces libstable-diffusion.so, so that object has to pass the
+# same linkage verdict as the backend itself.
+make_backend_with_library() {
+    local out=$1 library=$2 root
+    root=$(mktemp -d)
+    dpkg-deb -R "$work/vulkan.deb" "$root"
+    install -m 644 "$library" "$root/usr/lib/sd-cpp/libstable-diffusion.so"
+    dpkg-deb --root-owner-group --build "$root" "$out" >/dev/null
+    rm -rf "$root"
+}
+make_backend_with_library "$work/withlib.deb" "$system_so"
+out=$(EXPECT_COMMIT=0a565f2 "$script" "$work/loaded.deb" "$work/withlib.deb" 2>&1)
+check "exit status with a sound library" "$?" "0"
+printf '%s' "$out" | grep -q 'resolving libstable-diffusion.so' \
+    && ok "resolves the shipped library" || bad "resolves the shipped library"
+printf 'not an ELF object\n' > "$work/notelf.so"
+make_backend_with_library "$work/badlib.deb" "$work/notelf.so"
+EXPECT_COMMIT=0a565f2 "$script" "$work/loaded.deb" "$work/badlib.deb" >/dev/null 2>&1
+check "exit status with an unloadable library" "$?" "1"
+
 echo "== REQUIRE_FULL_LINKAGE is honoured =="
 # With a permitted library absent the undefined-symbol verdict cannot be
 # reached, and this flag stops that becoming a silent skip. The real path is

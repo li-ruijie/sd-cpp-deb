@@ -45,6 +45,81 @@ export LD_LIBRARY_PATH="$tree${BACKEND_STUB_DIR:+:$BACKEND_STUB_DIR}"
 
 status=0
 
+# Resolve one object from the backend package against the tree and judge what
+# ldd -r reports. Sets status on a fault and exits where nothing can be judged.
+resolve_object() {
+    local obj=$1 resolved missing unexpected_missing
+    echo "== resolving $obj against the base package =="
+    # ldd -r performs relocation, so it reports undefined symbols rather than
+    # only missing libraries. That is the ABI check this design rests on.
+    if ! resolved=$(ldd -r "$tree/$obj" 2>&1); then
+        echo "ldd could not process $obj at all:" >&2
+        printf '%s\n' "$resolved" >&2
+        exit 1
+    fi
+    # Print the whole list rather than only a verdict. The NCCL link in
+    # llama-cpp-deb was found by reading a passing test's output.
+    printf '%s\n' "$resolved"
+
+    # The link that actually matters. A ggml backend declares libggml-base.so.0
+    # and must bind to the base package's copy rather than to some other one on
+    # the machine. This holds whatever else is missing from the environment.
+    #
+    # Conditional on the object declaring it, so the check describes the object
+    # in front of it rather than assuming. Whether a real backend declares it at
+    # all is asserted in the workflow, against the real object, since a
+    # stand-in library in the unit tests cannot exercise that path.
+    if readelf -d "$tree/$obj" 2>/dev/null \
+         | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | grep -q '^libggml-base\.so'; then
+        if printf '%s\n' "$resolved" | grep -q "libggml-base.so.0 => $tree/"; then
+            echo "libggml-base.so.0 resolved to the base package"
+        else
+            echo "$obj declares libggml-base.so.0 but did not bind to" >&2
+            echo "the copy in this package:" >&2
+            printf '%s\n' "$resolved" | grep 'libggml-base' | sed 's/^/  /' >&2
+            status=1
+        fi
+    else
+        echo "note: this object declares no libggml-base dependency"
+    fi
+
+    # Split missing libraries into the ones the target machine legitimately
+    # supplies and everything else.
+    permitted='libcuda\.so|libcudart\.so|libcublas\.so|libcublasLt\.so|libvulkan\.so'
+    missing=$(printf '%s\n' "$resolved" | grep 'not found' || true)
+    unexpected_missing=$(printf '%s\n' "$missing" | grep -vE "$permitted" || true)
+
+    if [ -n "$(printf '%s' "$unexpected_missing" | tr -d '[:space:]')" ]; then
+        echo "$obj is missing a library it needs:" >&2
+        printf '%s\n' "$unexpected_missing" | sed 's/^/  /' >&2
+        status=1
+    fi
+
+    # An undefined symbol is only evidence of an ABI fault when every library
+    # resolved. Where a permitted one is absent, the loader reports every symbol
+    # it would have provided as undefined, so the verdict would be meaningless.
+    # Measured on 2026-08-28: with libvulkan.so.1 absent, ldd -r reports
+    # vkGetInstanceProcAddr and three others undefined against a backend that is
+    # in fact correct.
+    if [ -n "$(printf '%s' "$missing" | tr -d '[:space:]')" ]; then
+        echo "note: these libraries are absent here, so the undefined-symbol" >&2
+        echo "verdict cannot be reached:" >&2
+        printf '%s\n' "$missing" | sed 's/^/  /' >&2
+        # REQUIRE_FULL_LINKAGE stops that from becoming a silent skip. Every CI
+        # job sets it, having installed the loader or supplied a stub, so an
+        # environment that quietly stopped testing fails instead.
+        if [ -n "${REQUIRE_FULL_LINKAGE:-}" ]; then
+            echo "REQUIRE_FULL_LINKAGE is set, so this is a failure rather" >&2
+            echo "than an unjudged check. Install the loader, or supply it" >&2
+            echo "through BACKEND_STUB_DIR, before running this." >&2
+            status=1
+        fi
+    elif printf '%s\n' "$resolved" | grep -q 'undefined symbol'; then
+        echo "$obj has undefined symbols against the base package" >&2
+        status=1
+    fi
+}
+
 # Called through /usr/bin rather than from $tree. The binaries carry
 # RUNPATH=$ORIGIN and reaching them through the symlink is what an installed
 # package actually does, so testing in place would pass even with the symlink
@@ -83,74 +158,16 @@ if [ "$#" -eq 2 ]; then
         exit 1
     fi
 
-    echo "== resolving $backend against the base package =="
-    # ldd -r performs relocation, so it reports undefined symbols rather than
-    # only missing libraries. That is the ABI check this design rests on.
-    if ! resolved=$(ldd -r "$tree/$backend" 2>&1); then
-        echo "ldd could not process the backend at all:" >&2
-        printf '%s\n' "$resolved" >&2
-        exit 1
-    fi
-    # Print the whole list rather than only a verdict. The NCCL link in
-    # llama-cpp-deb was found by reading a passing test's output.
-    printf '%s\n' "$resolved"
+    resolve_object "$backend"
 
-    # The link that actually matters. A ggml backend declares libggml-base.so.0
-    # and must bind to the base package's copy rather than to some other one on
-    # the machine. This holds whatever else is missing from the environment.
-    #
-    # Conditional on the object declaring it, so the check describes the object
-    # in front of it rather than assuming. Whether a real backend declares it at
-    # all is asserted in the workflow, against the real object, since a
-    # stand-in library in the unit tests cannot exercise that path.
-    if readelf -d "$tree/$backend" 2>/dev/null \
-         | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | grep -q '^libggml-base\.so'; then
-        if printf '%s\n' "$resolved" | grep -q "libggml-base.so.0 => $tree/"; then
-            echo "libggml-base.so.0 resolved to the base package"
-        else
-            echo "the backend declares libggml-base.so.0 but did not bind to" >&2
-            echo "the copy in this package:" >&2
-            printf '%s\n' "$resolved" | grep 'libggml-base' | sed 's/^/  /' >&2
-            status=1
-        fi
-    else
-        echo "note: this object declares no libggml-base dependency"
-    fi
-
-    # Split missing libraries into the ones the target machine legitimately
-    # supplies and everything else.
-    permitted='libcuda\.so|libcudart\.so|libcublas\.so|libcublasLt\.so|libvulkan\.so'
-    missing=$(printf '%s\n' "$resolved" | grep 'not found' || true)
-    unexpected_missing=$(printf '%s\n' "$missing" | grep -vE "$permitted" || true)
-
-    if [ -n "$(printf '%s' "$unexpected_missing" | tr -d '[:space:]')" ]; then
-        echo "the backend is missing a library it needs:" >&2
-        printf '%s\n' "$unexpected_missing" | sed 's/^/  /' >&2
-        status=1
-    fi
-
-    # An undefined symbol is only evidence of an ABI fault when every library
-    # resolved. Where a permitted one is absent, the loader reports every symbol
-    # it would have provided as undefined, so the verdict would be meaningless.
-    # Measured on 2026-08-28: with libvulkan.so.1 absent, ldd -r reports
-    # vkGetInstanceProcAddr and three others undefined against a backend that is
-    # in fact correct.
-    if [ -n "$(printf '%s' "$missing" | tr -d '[:space:]')" ]; then
-        echo "note: these libraries are absent here, so the undefined-symbol" >&2
-        echo "verdict cannot be reached:" >&2
-        printf '%s\n' "$missing" | sed 's/^/  /' >&2
-        # REQUIRE_FULL_LINKAGE stops that from becoming a silent skip. Every CI
-        # job sets it, having installed the loader or supplied a stub, so an
-        # environment that quietly stopped testing fails instead.
-        if [ -n "${REQUIRE_FULL_LINKAGE:-}" ]; then
-            echo "REQUIRE_FULL_LINKAGE is set, so this is a failure rather" >&2
-            echo "than an unjudged check. Install the loader, or supply it" >&2
-            echo "through BACKEND_STUB_DIR, before running this." >&2
-            status=1
-        fi
-    elif printf '%s\n' "$resolved" | grep -q 'undefined symbol'; then
-        echo "the backend has undefined symbols against the base package" >&2
-        status=1
+    # A backend package may also replace libstable-diffusion.so, as sd-cpp-cuda
+    # does from master-1037. Extracted after the base, its copy is the one in
+    # the tree, so it is judged the same way as the backend. The listing is
+    # captured first, since dpkg-deb piped into grep -q can take SIGPIPE.
+    backend_listing=$(dpkg-deb -c "$2")
+    if printf '%s\n' "$backend_listing" \
+         | grep -q '\./usr/lib/sd-cpp/libstable-diffusion\.so$'; then
+        resolve_object libstable-diffusion.so
     fi
 fi
 
