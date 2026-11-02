@@ -11,6 +11,11 @@
 # alone would ship an object compiled against a base that was never published,
 # which fails to load on a user's machine with no useful message. The assertion
 # below is the guard on that.
+#
+# libstable-diffusion.so is the one permitted difference. From master-1037 the
+# Vulkan build compiles Vulkan kernels for RoPE and INT8 into it, and the base
+# package is built from the Vulkan archive to carry them, so the backend and
+# that library still come from one build.
 set -euo pipefail
 
 if [ "$#" -ne 4 ]; then
@@ -24,6 +29,7 @@ version=$3
 outdir=$4
 
 backend_name=libggml-vulkan.so
+sd_library=libstable-diffusion.so
 
 case "$version" in
     [0-9]*) ;;
@@ -41,8 +47,8 @@ mkdir -p "$staging/vulkan" "$staging/cpu"
 unzip -qq "$vulkan_zip" -d "$staging/vulkan"
 unzip -qq "$cpu_zip"    -d "$staging/cpu"
 
-# Every member of the Vulkan archive must either be the backend or be identical
-# to its CPU counterpart. Compared by content rather than by name, so a rebuild
+# Every member of the Vulkan archive must be the backend, the library, or
+# identical to its CPU counterpart. Compared by content rather than by name, so a rebuild
 # that silently changed a library is caught as well as a renamed one.
 missing_backend=1
 status=0
@@ -52,6 +58,10 @@ for path in "$staging/vulkan"/*; do
 
     if [ "$name" = "$backend_name" ]; then
         missing_backend=0
+        continue
+    fi
+
+    if [ "$name" = "$sd_library" ]; then
         continue
     fi
 
@@ -75,7 +85,8 @@ fi
 if [ "$status" -ne 0 ]; then
     echo >&2
     echo "The Vulkan archive is expected to be the CPU archive plus exactly" >&2
-    echo "$backend_name, and it is not, so upstream has changed how it builds" >&2
+    echo "$backend_name, with only $sd_library allowed to differ, and it" >&2
+    echo "is not, so upstream has changed how it builds" >&2
     echo "these. Re-measure before shipping: the backend may no longer match" >&2
     echo "the base package this depends on." >&2
     exit 1

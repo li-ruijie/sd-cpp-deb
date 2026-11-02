@@ -189,16 +189,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
-      - name: Download the upstream CPU archive
+      # The Vulkan archive rather than the CPU one. From master-1037 its
+      # libstable-diffusion.so carries the Vulkan kernels for RoPE and INT8,
+      # which register nothing without a Vulkan device, and every other member
+      # matches the CPU archive, which package-vulkan.sh asserts.
+      - name: Download the upstream Vulkan archive
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.tag }}
-          ASSET: ${{ needs.check.outputs.cpu_asset }}
+          ASSET: ${{ needs.check.outputs.vulkan_asset }}
         run: gh release download "$TAG" --repo "$UPSTREAM" --pattern "$ASSET" --dir .
 
       - name: Assert the ABI floor has not risen
         env:
-          ASSET: ${{ needs.check.outputs.cpu_asset }}
+          ASSET: ${{ needs.check.outputs.vulkan_asset }}
         run: |
           # Upstream builds on ubuntu-latest, so a runner image bump moves this
           # floor with no announcement. 2.38 already excludes bookworm, and a
@@ -247,6 +251,8 @@ jobs:
           # must be covered by a Depends entry, and libgomp1 is the only one.
           needed=$(for f in probe/*.so probe/*.so.* probe/sd-cli probe/sd-server; do
                      [ -f "$f" ] || continue
+                     # Ships in sd-cpp-vulkan, which declares libvulkan1.
+                     [ "${f##*/}" = libggml-vulkan.so ] && continue
                      readelf -d "$f" 2>/dev/null \
                        | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'
                    done | sort -u)
@@ -272,7 +278,7 @@ jobs:
 
       - name: Build sd-cpp
         env:
-          ASSET: ${{ needs.check.outputs.cpu_asset }}
+          ASSET: ${{ needs.check.outputs.vulkan_asset }}
           VERSION: ${{ needs.check.outputs.version }}
         run: bash scripts/package-base.sh "$ASSET" "$VERSION" dist
 
@@ -318,7 +324,7 @@ jobs:
           # The base is rebuilt here rather than pulled from the base job, since
           # the smoke test needs both packages and an artifact round trip costs
           # more than an unzip.
-          bash scripts/package-base.sh   "$CPU_ASSET" "$VERSION" dist
+          bash scripts/package-base.sh   "$VULKAN_ASSET" "$VERSION" dist
           bash scripts/package-vulkan.sh "$VULKAN_ASSET" "$CPU_ASSET" \
                                          "$VERSION" dist
 
@@ -564,7 +570,7 @@ jobs:
       - name: Rebuild the base package for the smoke test
         env:
           TAG: ${{ needs.check.outputs.tag }}
-          ASSET: ${{ needs.check.outputs.cpu_asset }}
+          ASSET: ${{ needs.check.outputs.vulkan_asset }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           curl -fsSL -o "$ASSET" \

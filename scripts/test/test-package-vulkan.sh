@@ -59,12 +59,23 @@ printf '%s' "$ctrl" | grep -q '^Depends:.*mesa-vulkan-drivers' \
 
 echo "== a divergent shared file is refused =="
 cp "$work/vulkan.zip" "$work/bad.zip"
-d=$(mktemp -d); printf 'CHANGED\n' > "$d/libstable-diffusion.so"
-( cd "$d" && zip -qg "$work/bad.zip" libstable-diffusion.so ); rm -rf "$d"
+d=$(mktemp -d); printf 'CHANGED\n' > "$d/libggml-base.so.0.19.0"
+( cd "$d" && zip -qg "$work/bad.zip" libggml-base.so.0.19.0 ); rm -rf "$d"
 out=$("$script" "$work/bad.zip" "$work/cpu.zip" 0.0.829 "$work/out2" 2>&1)
 check "exit status on divergence" "$?" "1"
-printf '%s' "$out" | grep -q 'libstable-diffusion.so' \
+printf '%s' "$out" | grep -q 'libggml-base.so.0.19.0' \
     && ok "names the offending file" || bad "names the offending file"
+
+echo "== libstable-diffusion.so may differ =="
+# From master-1037 the Vulkan build compiles Vulkan kernels into it, and the
+# base package carries that build, so this difference is expected.
+cp "$work/vulkan.zip" "$work/vklib.zip"
+d=$(mktemp -d); printf 'the library with vulkan kernels\n' > "$d/libstable-diffusion.so"
+( cd "$d" && zip -qg "$work/vklib.zip" libstable-diffusion.so ); rm -rf "$d"
+"$script" "$work/vklib.zip" "$work/cpu.zip" 0.0.829 "$work/out8" >/dev/null 2>"$work/err8"
+rc=$?
+check "exit status when only the library differs" "$rc" "0"
+[ "$rc" -eq 0 ] || sed 's/^/       /' "$work/err8"
 
 echo "== a Vulkan archive missing the backend is refused =="
 cp "$work/cpu.zip" "$work/nobackend.zip"

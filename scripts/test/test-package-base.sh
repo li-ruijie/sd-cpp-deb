@@ -129,11 +129,34 @@ rc=$?
 check "exit status with the launchers present" "$rc" "0"
 [ "$rc" -eq 0 ] || sed 's/^/       /' "$work/err8"
 if [ -f "$deb8" ]; then
-    dpkg-deb -c "$deb8" | grep -q 'start-server' \
+    # Captured first. Piped straight into grep -q, dpkg-deb can take SIGPIPE,
+    # and under pipefail that reads as no match whatever the listing holds.
+    listing=$(dpkg-deb -c "$deb8")
+    printf '%s\n' "$listing" | grep -q 'start-server' \
         && bad "launchers left out of the package" \
         || ok "launchers left out of the package"
 else
     bad "launchers left out of the package"
+fi
+
+echo "== the Vulkan backend is left to sd-cpp-vulkan =="
+# The base is built from the Vulkan archive, whose library carries the Vulkan
+# kernels, so the backend itself arrives here too and must not ship twice.
+zip9="$work/vulkan.zip"
+make_zip "$zip9"
+v=$(mktemp -d); printf 'vulkan backend\n' > "$v/libggml-vulkan.so"
+( cd "$v" && zip -qg "$zip9" libggml-vulkan.so ); rm -rf "$v"
+deb9=$("$script" "$zip9" 0.0.829 "$work/out9" 2>"$work/err9")
+rc=$?
+check "exit status on the Vulkan archive" "$rc" "0"
+[ "$rc" -eq 0 ] || sed 's/^/       /' "$work/err9"
+if [ -f "$deb9" ]; then
+    listing=$(dpkg-deb -c "$deb9")
+    printf '%s\n' "$listing" | grep -q 'libggml-vulkan' \
+        && bad "backend left out of the base package" \
+        || ok "backend left out of the base package"
+else
+    bad "backend left out of the base package"
 fi
 
 echo "== a missing expected tool fails the build =="

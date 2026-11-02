@@ -33,6 +33,12 @@ tools="sd-cli sd-server"
 # check below still catches anything else new.
 launchers="start-server.sh start-server.bat"
 
+# The workflow builds this package from the Vulkan archive, since from
+# master-1037 its libstable-diffusion.so carries the Vulkan kernels for RoPE
+# and INT8, and those register nothing without a Vulkan device. The backend
+# that archive also holds ships separately as sd-cpp-vulkan.
+backends="libggml-vulkan.so"
+
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 
@@ -51,7 +57,7 @@ chmod 0755 "$root/DEBIAN"
 # Upstream's zip stores every file at the top level, with no wrapping directory.
 unzip -qq "$archive" -d "$libdir"
 
-for name in $launchers; do
+for name in $launchers $backends; do
     rm -f "$libdir/$name"
 done
 
