@@ -4,20 +4,20 @@ Builds `sd-cpp`, `sd-cpp-vulkan`, and `sd-cpp-cuda` for
 [li-ruijie/apt](https://li-ruijie.github.io/apt/), from
 [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
 
-`sd-cpp` carries `sd-cli` and `sd-server`, repackaged from the upstream Linux release archive.
-`sd-cpp-vulkan` adds one ggml shared object. `sd-cpp-cuda` adds the CUDA backend and also replaces
-`libstable-diffusion.so` with a CUDA build, through a `dpkg-divert` that removing the package
-undoes, since upstream compiles its CUDA kernels for RoPE, INT8, and attention into that library.
-Both backend packages may be installed together.
+`sd-cpp` carries `sd-cli` and `sd-server`, compiled from upstream source at each release tag.
+`sd-cpp-vulkan` adds one ggml shared object from the same build. `sd-cpp-cuda` adds the CUDA
+backend and also replaces `libstable-diffusion.so` with a CUDA build, through a `dpkg-divert` that
+removing the package undoes, since upstream compiles its CUDA kernels for RoPE, INT8, and
+attention into that library. Both backend packages may be installed together.
 
 ## Requirements
 
 amd64 only, since upstream publishes no Linux arm64 build of any variant.
 
-Debian trixie or newer, or a distribution of equivalent vintage. The upstream archives are built
-on Ubuntu 24.04 and need glibc 2.38 and libstdc++ 13.1, which bookworm does not have. Where the
-requirement is unmet apt refuses the install rather than the binary failing to start, since both
-floors are declared.
+Debian trixie or newer, or a distribution of equivalent vintage. The packages are built on Ubuntu
+24.04 and need glibc 2.38 and libstdc++ 13.1, which bookworm does not have. Where the requirement
+is unmet apt refuses the install rather than the binary failing to start, since both floors are
+declared.
 
 ## Install
 
@@ -52,11 +52,20 @@ same APT repository covers the Hugging Face half.
 
 ## Building
 
-The whole build runs in GitHub Actions, weekly on Sunday at 09:00 UTC and on demand. Only the CUDA
-package is compiled, both its backend and its `libstable-diffusion.so`. The base and Vulkan packages
-divide upstream's prebuilt Vulkan archive between them, after asserting that the archive matches
-the CPU one except for the backend and `libstable-diffusion.so`, whose Vulkan kernels register
-nothing without a Vulkan device.
+The whole build runs in GitHub Actions, weekly on Sunday at 09:00 UTC and on demand. Two compiles
+run side by side, both in Ubuntu 24.04 containers at the upstream release tag.
+
+- One compile uses upstream's own Linux Vulkan configuration, web interface included, and the base
+  and Vulkan packages divide its output between them. Its `libstable-diffusion.so` carries Vulkan
+  kernels, which register nothing without a Vulkan device.
+- The other compiles the CUDA backend and a CUDA build of `libstable-diffusion.so`.
+
+Upstream publishes prebuilt Linux archives, and until November 2026 the base and Vulkan packages
+were repackaged from them. From `master-1050` those archives require glibc 2.43, since upstream
+builds on GitHub's `ubuntu-latest`, which moved to 26.04. That excludes Debian trixie, at 2.41.
+
+Before anything is published, every shipped object is checked against the declared glibc and
+libstdc++ floors. The base and Vulkan packages are then smoke tested on Debian trixie itself.
 
 ## Licensing
 
@@ -67,15 +76,15 @@ matching the sibling builders and the APT repository itself. See `LICENSE`.
 
 The packaged software is upstream's and stays under upstream's terms, which are MIT for
 stable-diffusion.cpp and for ggml. Those texts ship inside every `sd-cpp` package at
-`/usr/share/doc/sd-cpp/`, taken from the release archive rather than copied here, so they can never
-drift from the build they describe. The CUDA build of the library also compiles in CUTLASS, under
-BSD-3-Clause, and SageAttention, under Apache-2.0, and `sd-cpp-cuda` ships both texts at
-`/usr/share/doc/sd-cpp-cuda/`, taken from the source tree it was built from.
+`/usr/share/doc/sd-cpp/`, taken from the source tree at the release tag rather than copied here, so
+they can never drift from the build they describe. The CUDA build of the library also compiles in
+CUTLASS, under BSD-3-Clause, and SageAttention, under Apache-2.0, and `sd-cpp-cuda` ships both
+texts at `/usr/share/doc/sd-cpp-cuda/`, taken from the source tree it was built from.
 
 ## Tests
 
 Every suite runs in CI on each build, and locally under WSL. They need `bash`, `dpkg-deb`, `zip`,
-`unzip`, and `readelf`, with no compiler and no network access.
+`unzip`, `readelf`, and `objdump`, with no compiler and no network access.
 
 ```sh
 for t in scripts/test/test-*.sh; do bash "$t" || echo "FAILED $t"; done

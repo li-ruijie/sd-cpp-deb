@@ -43,8 +43,6 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       sha: ${{ steps.resolve.outputs.sha }}
       version: ${{ steps.resolve.outputs.version }}
-      cpu_asset: ${{ steps.resolve.outputs.cpu_asset }}
-      vulkan_asset: ${{ steps.resolve.outputs.vulkan_asset }}
       skip: ${{ steps.resolve.outputs.skip }}
     steps:
       - name: Resolve the upstream tag and decide whether to build
@@ -93,33 +91,15 @@ jobs:
           # 0.0.830 as apt expects.
           VERSION="0.0.${COUNT}"
 
-          # Matched by pattern rather than exact name, since the Ubuntu version
-          # sits in the filename and moves when upstream's ubuntu-latest moves.
-          # An actual ABI change is caught by the floor assertion in the base
-          # job, which is the thing that matters.
-          assets=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name')
-          CPU_ASSET=$(printf '%s\n' "$assets" \
-            | grep -E 'bin-Linux-.*-x86_64\.zip$' | head -1)
-          VULKAN_ASSET=$(printf '%s\n' "$assets" \
-            | grep -E 'bin-Linux-.*-x86_64-vulkan\.zip$' | head -1)
-
-          # Asserted before anything is downloaded, so an incomplete release
-          # fails at the cheap end rather than after 79 MB has been fetched.
-          if [ -z "$CPU_ASSET" ] || [ -z "$VULKAN_ASSET" ]; then
-            echo "::error::$TAG does not carry both Linux archives"
-            printf '%s\n' "$assets"
-            exit 1
-          fi
-
+          # Upstream's release assets are no longer read. Its Linux archives
+          # moved to Ubuntu 26.04 and require GLIBC_2.43, beyond Debian
+          # trixie, so the build job compiles the same tag from source. The
+          # release only marks which commits upstream considers built.
           echo "Upstream $TAG, commit $SHA, version $VERSION"
-          echo "  cpu    : $CPU_ASSET"
-          echo "  vulkan : $VULKAN_ASSET"
           {
             echo "tag=$TAG"
             echo "sha=$SHA"
             echo "version=$VERSION"
-            echo "cpu_asset=$CPU_ASSET"
-            echo "vulkan_asset=$VULKAN_ASSET"
           } >> "$GITHUB_OUTPUT"
 
           # The range must anchor on ^Package: sd-cpp$, since sd-cpp-cuda and
@@ -181,81 +161,121 @@ jobs:
           done
           exit "$status"
 
-  base:
+  # Compiles what sd-cpp and sd-cpp-vulkan ship, in place of downloading
+  # upstream's Linux archives. Upstream builds those on ubuntu-latest, which
+  # moved to Ubuntu 26.04 in October 2026, and from master-1050 they require
+  # GLIBC_2.43 through sqrtf and atan2f. Debian trixie carries 2.41. Ubuntu
+  # 24.04 reproduces the GLIBC_2.38 and GLIBCXX_3.4.32 floor every package
+  # since 0.0.830 has declared, and matches the CUDA container below.
+  build:
     needs: check
     if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
     steps:
-      - name: Checkout
+      - name: Install build dependencies
+        run: |
+          # Before checkout, which needs git present or it falls back to a REST
+          # download. libvulkan-dev, glslc, and spirv-headers are what
+          # upstream's own Linux Vulkan job installs. binutils supplies readelf
+          # for the floor and linkage checks.
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git ca-certificates cmake zip unzip xz-utils \
+            binutils libvulkan-dev glslc spirv-headers
+
+      - name: Checkout this repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
-      # The Vulkan archive rather than the CPU one. From master-1037 its
-      # libstable-diffusion.so carries the Vulkan kernels for RoPE and INT8,
-      # which register nothing without a Vulkan device, and every other member
-      # matches the CPU archive, which package-vulkan.sh asserts.
-      - name: Download the upstream Vulkan archive
+      # The versions upstream's own Linux jobs pin. Without pnpm on PATH,
+      # upstream's CMake builds sd-server with no web interface and says so only
+      # in a warning, which the step after the compile turns into a failure.
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1   # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413   # v6.1.0
+        with:
+          version: 10.15.1
+
+      - name: Check out upstream at the resolved tag
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.tag }}
-          ASSET: ${{ needs.check.outputs.vulkan_asset }}
-        run: gh release download "$TAG" --repo "$UPSTREAM" --pattern "$ASSET" --dir .
+        run: |
+          # The exact tag, so upstream's CMake reads the real commit through git
+          # rev-parse and the smoke test can assert it. Only the four submodules
+          # this build compiles. CUTLASS is large and only the CUDA job uses it.
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/leejet/stable-diffusion.cpp.git upstream
+          git -C upstream submodule update --init --depth 1 \
+            ggml examples/server/frontend thirdparty/libwebp thirdparty/libwebm
+
+      - name: Compile
+        working-directory: upstream
+        run: |
+          # Upstream's Linux Vulkan configure line, unchanged. Its CMakeLists
+          # defaults the build type to Release.
+          cmake -B build \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DSD_BUILD_SHARED_GGML_LIB=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' 2>&1 | tee ../configure.log
+          cmake --build build -j"$(nproc)"
+
+      - name: Assert the web interface was embedded
+        run: |
+          # Upstream's CMake treats a missing pnpm as a warning and builds
+          # sd-server without its interface, so a green compile proves nothing.
+          fail() { echo "::error::$*"; exit 1; }
+          grep -F 'pnpm found:' configure.log || fail "CMake did not find pnpm"
+          if grep -F 'frontend build disabled' configure.log; then
+            fail "CMake disabled the frontend build"
+          fi
+          header=upstream/examples/server/frontend/dist/gen_index_html.h
+          [ -s "$header" ] || fail "no generated interface header at $header"
+          echo "web interface embedded, header $(stat -c %s "$header") bytes"
+
+      - name: List the objects
+        id: objects
+        run: |
+          # Real files only. CMake lays the versioned libraries out as symlink
+          # chains, and each target is measured once.
+          objects=$(find upstream/build/bin -maxdepth 1 -type f \
+            -exec sh -c 'readelf -h "$1" >/dev/null 2>&1' _ {} \; -print | sort)
+          printf '%s\n' "$objects"
+          printf 'objects<<END\n%s\nEND\n' "$objects" >> "$GITHUB_OUTPUT"
 
       - name: Assert the ABI floor has not risen
         env:
-          ASSET: ${{ needs.check.outputs.vulkan_asset }}
+          OBJECTS: ${{ steps.objects.outputs.objects }}
         run: |
-          # Upstream builds on ubuntu-latest, so a runner image bump moves this
-          # floor with no announcement. 2.38 already excludes bookworm, and a
-          # move to 2.41 would exclude trixie too, which is the whole supported
-          # target. A rise fails the build. A fall is harmless and only means
-          # the declared Depends is stricter than it needs to be, so it is
-          # reported rather than treated as an error.
-          mkdir -p probe && unzip -qq "$ASSET" -d probe
-          highest() {
-            readelf -V probe/sd-cli | grep -oE "$1_[0-9.]+" | sort -uV | tail -1
-          }
-          glibc=$(highest GLIBC)
-          cxx=$(highest GLIBCXX)
-          echo "measured $glibc and $cxx"
-
-          exceeds() {
-            # true when $1 sorts strictly above $2
-            [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ] \
-              && [ "$1" != "$2" ]
-          }
-
-          fail=0
-          if exceeds "$glibc" GLIBC_2.38; then
-            echo "::error::glibc floor rose from GLIBC_2.38 to $glibc"
-            echo "Update Depends in package-base.sh and package-vulkan.sh, and"
-            echo "revisit which suites can run this at all."
-            fail=1
-          elif [ "$glibc" != "GLIBC_2.38" ]; then
-            echo "::notice::glibc floor fell to $glibc, Depends is now stricter than needed"
-          fi
-
-          if exceeds "$cxx" GLIBCXX_3.4.32; then
-            echo "::error::libstdc++ floor rose from GLIBCXX_3.4.32 to $cxx"
-            fail=1
-          elif [ "$cxx" != "GLIBCXX_3.4.32" ]; then
-            echo "::notice::libstdc++ floor fell to $cxx, Depends is stricter than needed"
-          fi
-
-          exit "$fail"
+          # Every object, since on 2026-11-08 the floor rose in the libraries
+          # while sd-cli stayed put. 2.38 already excludes bookworm, and a move
+          # to 2.42 would exclude trixie, which is the whole supported target.
+          mapfile -t objs <<< "$OBJECTS"
+          bash scripts/check-abi-floor.sh 2.38 3.4.32 "${objs[@]}"
 
       - name: Assert the declared runtime dependencies match the linkage
+        env:
+          OBJECTS: ${{ steps.objects.outputs.objects }}
         run: |
           # Depends is derived from measurement, so it has to be rechecked
           # against measurement or it silently goes stale. Everything the
           # payload links beyond the bundled objects and the C and C++ runtimes
           # must be covered by a Depends entry, and libgomp1 is the only one.
-          needed=$(for f in probe/*.so probe/*.so.* probe/sd-cli probe/sd-server; do
-                     [ -f "$f" ] || continue
+          needed=$(while read -r f; do
                      # Ships in sd-cpp-vulkan, which declares libvulkan1.
                      [ "${f##*/}" = libggml-vulkan.so ] && continue
                      readelf -d "$f" 2>/dev/null \
                        | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'
-                   done | sort -u)
+                   done <<< "$OBJECTS" | sort -u)
           printf '%s\n' "$needed" | sed 's/^/  /'
 
           known='^(libstable-diffusion|libggml|libggml-base|libwebp|libwebpmux'
@@ -276,11 +296,66 @@ jobs:
             exit 1; }
           echo "every linked library is covered by Depends"
 
+      - name: Pack the archive
+        run: |
+          # Upstream's own pack step, so package-base.sh and package-vulkan.sh
+          # receive the layout they were written against. zip follows the
+          # symlinks and stores each as a copy, as upstream's archive does,
+          # and package-base.sh collapses those copies again. The launcher
+          # scripts upstream adds are left out, since they suit an unpacked
+          # folder and not /usr/lib/sd-cpp.
+          cp upstream/ggml/LICENSE upstream/build/bin/ggml.txt
+          cp upstream/LICENSE upstream/build/bin/stable-diffusion.cpp.txt
+          zip -qj archive.zip upstream/build/bin/*
+          unzip -l archive.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: archive
+          path: archive.zip
+          if-no-files-found: error
+
+  # On Debian trixie itself, since the smoke test runs the binaries against the
+  # host's glibc. On ubuntu-latest, which became 26.04, binaries requiring
+  # GLIBC_2.43 loaded and passed, so the host proved nothing about the target.
+  base:
+    needs: [check, build]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    steps:
+      - name: Install what packaging and the smoke test need
+        run: |
+          # readelf for the smoke test. dpkg-deb, cmp, and ldd are already in
+          # the image.
+          apt-get update
+          apt-get install -y --no-install-recommends binutils unzip
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Download the archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: archive
+
       - name: Build sd-cpp
         env:
-          ASSET: ${{ needs.check.outputs.vulkan_asset }}
           VERSION: ${{ needs.check.outputs.version }}
-        run: bash scripts/package-base.sh "$ASSET" "$VERSION" dist
+        run: bash scripts/package-base.sh archive.zip "$VERSION" dist
+
+      - name: Install the package with apt
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # Through apt rather than dpkg, so trixie's own archive resolves the
+          # declared Depends, which proves trixie can satisfy them. It also
+          # supplies what the smoke test loads, such as libgomp1, which this
+          # image lacks. The ubuntu-latest host carried libgomp1 already, so the
+          # smoke test once passed there without Depends being installed.
+          apt-get install -y --no-install-recommends "./dist/sd-cpp_${VERSION}_amd64.deb"
 
       - name: Smoke test
         env:
@@ -296,37 +371,38 @@ jobs:
           if-no-files-found: error
 
   vulkan:
-    needs: check
+    needs: [check, build]
     if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
     steps:
+      - name: Install a Vulkan loader, a software device, and the tools
+        run: |
+          # With no loader present ggml ignores the backend in silence, so this
+          # is what lets the smoke test assert anything at all. It also makes
+          # REQUIRE_FULL_LINKAGE satisfiable below. readelf comes from binutils.
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils unzip libvulkan1 mesa-vulkan-drivers vulkan-tools
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
-      - name: Download both upstream archives
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.check.outputs.tag }}
-          CPU_ASSET: ${{ needs.check.outputs.cpu_asset }}
-          VULKAN_ASSET: ${{ needs.check.outputs.vulkan_asset }}
-        run: |
-          # Both, since package-vulkan.sh proves they agree before taking one
-          # file out of one of them.
-          gh release download "$TAG" --repo "$UPSTREAM" \
-            --pattern "$CPU_ASSET" --pattern "$VULKAN_ASSET" --dir .
+      - name: Download the archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: archive
 
       - name: Build sd-cpp and sd-cpp-vulkan
         env:
-          CPU_ASSET: ${{ needs.check.outputs.cpu_asset }}
-          VULKAN_ASSET: ${{ needs.check.outputs.vulkan_asset }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           # The base is rebuilt here rather than pulled from the base job, since
           # the smoke test needs both packages and an artifact round trip costs
           # more than an unzip.
-          bash scripts/package-base.sh   "$VULKAN_ASSET" "$VERSION" dist
-          bash scripts/package-vulkan.sh "$VULKAN_ASSET" "$CPU_ASSET" \
-                                         "$VERSION" dist
+          bash scripts/package-base.sh   archive.zip "$VERSION" dist
+          bash scripts/package-vulkan.sh archive.zip "$VERSION" dist
 
       - name: Check the backend links nothing undeclared
         run: |
@@ -347,24 +423,28 @@ jobs:
               exit 1; }
           echo "the backend declares libggml-base"
 
-      - name: Install a Vulkan loader and a software device
-        run: |
-          # With no loader present ggml ignores the backend in silence, so this
-          # is what lets the smoke test assert anything at all. It also makes
-          # REQUIRE_FULL_LINKAGE satisfiable below.
-          sudo apt-get update
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
-
       - name: Record what the software rasteriser offers
         run: |
           # Kept for the record rather than to decide anything. An earlier
           # version of this job gated the device assertion on
           # storageBuffer16BitAccess, following the measurement in
           # whisper-cpp-deb that Ubuntu 22.04's llvmpipe lacks it. On 24.04
-          # lavapipe advertises it and ggml still reports "No devices found",
+          # lavapipe advertised it and ggml still reported "No devices found",
           # so that capability is necessary and not sufficient, and no property
-          # read out of vulkaninfo can stand in for asking ggml itself.
+          # read out of vulkaninfo can stand in for asking ggml itself. On
+          # trixie, with Mesa 25.0.7 and LLVM 19.1.7, ggml also reports "No
+          # devices found" while having loaded the backend.
           vulkaninfo --summary 2>&1 | head -40 || true
+
+      - name: Install both packages with apt
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # As in the base job, so trixie resolves the declared Depends of both
+          # and the smoke test finds what they name.
+          apt-get install -y --no-install-recommends \
+            "./dist/sd-cpp_${VERSION}_amd64.deb" \
+            "./dist/sd-cpp-vulkan_${VERSION}_amd64.deb"
 
       - name: Smoke test
         env:
@@ -407,14 +487,12 @@ jobs:
           # Before checkout, which needs git present or it falls back to a REST
           # download. No sudo: a container job already runs as root.
           apt-get update
-          # diffutils supplies cmp, which package-base.sh uses to prove the
-          # duplicate library copies really are identical before collapsing
-          # them to symlinks. dpkg supplies dpkg-deb. The Vulkan headers and
-          # glslc are what upstream's own Linux Vulkan job installs, needed here
-          # since the library is built with SD_VULKAN as well.
+          # dpkg supplies dpkg-deb. The Vulkan headers and glslc are what
+          # upstream's own Linux Vulkan job installs, needed here since the
+          # library is built with SD_VULKAN as well.
           apt-get install -y --no-install-recommends \
-            build-essential git ca-certificates curl unzip xz-utils \
-            diffutils dpkg ccache libvulkan-dev glslc spirv-headers
+            build-essential git ca-certificates curl xz-utils \
+            dpkg ccache libvulkan-dev glslc spirv-headers
 
       - name: Checkout this repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
@@ -494,15 +572,15 @@ jobs:
           # Dockerfile.cuda. This job wants libggml-cuda.so and
           # libstable-diffusion.so, and turning the examples off also removes
           # upstream's Node and pnpm requirement, which exists solely to embed
-          # the sd-server web UI. The base package already carries upstream's
-          # own build of both executables.
+          # the sd-server web UI. The build job compiles both executables for
+          # the base package.
           #
           # From master-1037 the CUDA kernels for RoPE, INT8, and attention are
           # compiled into libstable-diffusion.so, and sd-cpp-cuda replaces the
           # base copy with this build. SD_VULKAN is on as well, so the Vulkan
           # kernels the base copy carries survive the replacement. It also
           # compiles a libggml-vulkan.so, which is discarded, since
-          # sd-cpp-vulkan ships upstream's.
+          # sd-cpp-vulkan ships the one from the build job.
           #
           # GGML_CUDA_NCCL must stay OFF. It defaults on and this container
           # ships NCCL, so CMake would link libnccl.so.2 into the backend.
@@ -604,15 +682,60 @@ jobs:
             "${{ steps.backend.outputs.path }}" "${{ steps.backend.outputs.library }}" \
             upstream "$VERSION" "$SUFFIX" dist
 
-      - name: Rebuild the base package for the smoke test
+      - name: Assert the ABI floor of the CUDA objects
+        run: |
+          # sd-cpp-cuda declares no glibc or libstdc++ floor of its own and
+          # leans on the one sd-cpp declares, so its objects must not require
+          # more. This container carries glibc 2.39, one above that floor.
+          bash scripts/check-abi-floor.sh 2.38 3.4.32 \
+            "${{ steps.backend.outputs.path }}" "${{ steps.backend.outputs.library }}"
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: cuda
+          path: dist/sd-cpp-cuda_*.deb
+          if-no-files-found: error
+
+  # Separate from the compile so the base package can come from the build job
+  # without that job and the 40-minute compile running one after the other.
+  # The same image, since it is the one carrying the driver stubs beside the
+  # real libcudart and libcublas the backend links.
+  cuda-test:
+    needs: [check, build, cuda]
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:13.3.1-devel-ubuntu24.04
+    steps:
+      - name: Install what packaging and the tests need
+        run: |
+          # diffutils supplies cmp, which package-base.sh uses to prove the
+          # duplicate library copies really are identical before collapsing
+          # them to symlinks, and which the diversion test compares with.
+          # binutils supplies readelf for the smoke test.
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils diffutils dpkg unzip
+
+      - name: Checkout this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Download the archive and the CUDA package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          pattern: '{archive,cuda}'
+          merge-multiple: true
+
+      - name: Build the base package
         env:
-          TAG: ${{ needs.check.outputs.tag }}
-          ASSET: ${{ needs.check.outputs.vulkan_asset }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
-          curl -fsSL -o "$ASSET" \
-            "https://github.com/leejet/stable-diffusion.cpp/releases/download/$TAG/$ASSET"
-          bash scripts/package-base.sh "$ASSET" "$VERSION" dist
+          # From the build job's archive. This step once downloaded upstream's
+          # Linux archive instead, which is how GLIBC_2.43 objects reached the
+          # smoke test on 2026-11-08.
+          bash scripts/package-base.sh archive.zip "$VERSION" dist
+          mv "sd-cpp-cuda_${VERSION}_amd64.deb" dist/
 
       - name: Build a driver stub directory carrying the soname
         run: |
@@ -649,16 +772,20 @@ jobs:
         env:
           VERSION: ${{ needs.check.outputs.version }}
           EXPECT_COMMIT: ${{ needs.check.outputs.sha }}
-          ASSET: ${{ needs.check.outputs.vulkan_asset }}
-          LIBRARY: ${{ steps.backend.outputs.library }}
         run: |
           # The maintainer scripts only run under dpkg, and this container runs
           # as root with the CUDA runtime packages installed, so the diversion
-          # is exercised for real rather than read out of the scripts.
+          # is exercised for real rather than read out of the scripts. Both
+          # reference copies come from what ships, the base library from the
+          # archive and the CUDA library from the package itself.
           set -euo pipefail
           lib=/usr/lib/sd-cpp/libstable-diffusion.so
-          unzip -p "$ASSET" libstable-diffusion.so > base-library.so
+          unzip -p archive.zip libstable-diffusion.so > base-library.so
+          mkdir -p cuda-payload
+          dpkg-deb -x "dist/sd-cpp-cuda_${VERSION}_amd64.deb" cuda-payload
+          LIBRARY=cuda-payload$lib
           fail() { echo "::error::$*"; exit 1; }
+          cmp -s "$LIBRARY" base-library.so && fail "the two reference copies are identical"
 
           dpkg -i "dist/sd-cpp_${VERSION}_amd64.deb" "dist/sd-cpp-cuda_${VERSION}_amd64.deb"
           dpkg-divert --list "$lib"
@@ -685,23 +812,19 @@ jobs:
           [ ! -e "$lib" ] || fail "the library outlived both packages"
           echo "install, reinstall, and removal all left the library where expected"
 
-      - name: Upload
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
-        with:
-          name: cuda
-          path: dist/sd-cpp-cuda_*.deb
-          if-no-files-found: error
-
   publish:
-    needs: [check, test, base, vulkan, cuda]
+    needs: [check, test, build, base, vulkan, cuda, cuda-test]
     if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download every artifact
+      - name: Download the three packages
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
         with:
+          # By name, so the build job's archive, which is internal to the run,
+          # never lands beside the packages.
+          pattern: '{base,vulkan,cuda}'
           path: artifacts
           merge-multiple: true
 
