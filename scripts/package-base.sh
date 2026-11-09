@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Assemble sd-cpp_<version>_amd64.deb from an upstream stable-diffusion.cpp
-# Linux archive. No compilation: upstream publishes this build and we repackage
-# it unchanged apart from the layout.
+# Assemble sd-cpp_<version>_amd64.deb from the archive the build job compiles
+# from upstream source. That archive keeps the layout of upstream's own Linux
+# release zip, so this script packages either. Upstream's are no longer used,
+# since from November 2026 they require glibc 2.43, beyond Debian trixie.
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -27,16 +28,10 @@ esac
 # Upstream has already renamed this tool once, from sd to sd-cli.
 tools="sd-cli sd-server"
 
-# Launchers for an unpacked folder, shipped since master-982. Each looks for
-# sd-server, a models directory, and a local config beside itself, which here
-# would be /usr/lib/sd-cpp, and the .bat is for Windows. Removed by name so the
-# check below still catches anything else new.
-launchers="start-server.sh start-server.bat"
-
-# The workflow builds this package from the Vulkan archive, since from
-# master-1037 its libstable-diffusion.so carries the Vulkan kernels for RoPE
-# and INT8, and those register nothing without a Vulkan device. The backend
-# that archive also holds ships separately as sd-cpp-vulkan.
+# The archive is an SD_VULKAN build, since from master-1037 its
+# libstable-diffusion.so carries the Vulkan kernels for RoPE and INT8, and
+# those register nothing without a Vulkan device. The backend that archive
+# also holds ships separately as sd-cpp-vulkan.
 backends="libggml-vulkan.so"
 
 staging=$(mktemp -d)
@@ -57,13 +52,14 @@ chmod 0755 "$root/DEBIAN"
 # Upstream's zip stores every file at the top level, with no wrapping directory.
 unzip -qq "$archive" -d "$libdir"
 
-for name in $launchers $backends; do
+for name in $backends; do
     rm -f "$libdir/$name"
 done
 
-# The licence texts are documentation rather than payload. Both are required:
-# a missing one means upstream changed the archive, and distributing the
-# software without its terms is not an option.
+# The licence texts are documentation rather than payload. Both are required.
+# The build job copies them in from upstream's tree, so a missing one means
+# that tree or the build job changed, and distributing the software without
+# its terms is not an option.
 for name in stable-diffusion.cpp.txt ggml.txt; do
     if [ ! -f "$libdir/$name" ]; then
         echo "$0: the archive carries no $name" >&2
@@ -85,14 +81,14 @@ Source: https://github.com/leejet/stable-diffusion.cpp
 Files: *
 Copyright: Copyright (c) 2023 leejet and the stable-diffusion.cpp contributors
 License: MIT
- The full text ships alongside this file as stable-diffusion.cpp.txt, taken
- verbatim from the upstream release archive.
+ The full text ships alongside this file as stable-diffusion.cpp.txt, copied
+ verbatim from LICENSE in the upstream source at the release tag.
 
 Files: usr/lib/sd-cpp/libggml*
 Copyright: Copyright (c) 2023-2024 The ggml authors
 License: MIT
- The full text ships alongside this file as ggml.txt, taken verbatim from the
- upstream release archive.
+ The full text ships alongside this file as ggml.txt, copied verbatim from
+ ggml/LICENSE in the upstream source at the release tag.
 
 Comment:
  The packaging that produced this .deb is separate work, licensed AGPL-3.0,
@@ -177,15 +173,15 @@ Section: misc
 Priority: optional
 Description: stable-diffusion.cpp, diffusion model inference in C/C++
  Command line tool and HTTP server for image and video generation with Stable
- Diffusion, Flux, Wan, Qwen Image, and related models, repackaged from the
- upstream release archive. sd-server embeds a web interface and serves
- OpenAI-compatible, Automatic1111-compatible, and native APIs, listening on
- 127.0.0.1 by default.
+ Diffusion, Flux, Wan, Qwen Image, and related models, compiled from the
+ upstream source at the release tag. sd-server embeds a web interface and
+ serves OpenAI-compatible, Automatic1111-compatible, and native APIs,
+ listening on 127.0.0.1 by default.
  .
- amd64 only, as upstream publishes no Linux arm64 build. The archives are
- built on Ubuntu 24.04, so glibc 2.38 and libstdc++ 13.1 are required. Debian
- trixie satisfies both and bookworm does not, which is why those floors are
- declared rather than left to fail at run time.
+ amd64 only, as upstream publishes no Linux arm64 build. It is compiled on
+ Ubuntu 24.04, so glibc 2.38 and libstdc++ 13.1 are required. Debian trixie
+ satisfies both and bookworm does not, which is why those floors are declared
+ rather than left to fail at run time.
  .
  Models are not included and are not downloaded at install time. They run to
  several gigabytes and come from more than one hub, so fetching them is left
