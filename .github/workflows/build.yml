@@ -43,6 +43,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       sha: ${{ steps.resolve.outputs.sha }}
       version: ${{ steps.resolve.outputs.version }}
+      vulkan_asset: ${{ steps.resolve.outputs.vulkan_asset }}
       skip: ${{ steps.resolve.outputs.skip }}
     steps:
       - name: Resolve the upstream tag and decide whether to build
@@ -91,10 +92,6 @@ jobs:
           # 0.0.830 as apt expects.
           VERSION="0.0.${COUNT}"
 
-          # Upstream's release assets are no longer read. Its Linux archives
-          # moved to Ubuntu 26.04 and require GLIBC_2.43, beyond Debian
-          # trixie, so the build job compiles the same tag from source. The
-          # release only marks which commits upstream considers built.
           echo "Upstream $TAG, commit $SHA, version $VERSION"
           {
             echo "tag=$TAG"
@@ -114,6 +111,7 @@ jobs:
           if [ "$VERSION" = "$DEPLOYED" ] && [ "$FORCE" != "true" ]; then
             echo "Version $VERSION already deployed, skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           elif [ "$VERSION" = "$DEPLOYED" ]; then
             echo "Rebuilding $VERSION (forced)"
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -121,6 +119,25 @@ jobs:
             echo "New version $VERSION (deployed: ${DEPLOYED:-none})"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+          # Upstream's Linux archives moved to Ubuntu 26.04 and require
+          # GLIBC_2.43, beyond Debian trixie, so nothing from them ships and the
+          # build job compiles the same tag from source. The Vulkan archive is
+          # still downloaded, as the reference compare-upstream.sh holds that
+          # build equal to. Matched by pattern, since the Ubuntu version sits in
+          # the filename. Only a run that builds needs it, and a release without
+          # it fails here, before any compile, rather than shipping a build
+          # nothing was compared against.
+          assets=$(gh api "repos/$UPSTREAM/releases/tags/$TAG" --jq '.assets[].name')
+          VULKAN_ASSET=$(printf '%s\n' "$assets" \
+            | grep -E 'bin-Linux-.*-x86_64-vulkan\.zip$' | head -1 || true)
+          if [ -z "$VULKAN_ASSET" ]; then
+            echo "::error::$TAG carries no Linux Vulkan archive to compare the build against"
+            printf '%s\n' "$assets"
+            exit 1
+          fi
+          echo "reference archive: $VULKAN_ASSET"
+          echo "vulkan_asset=$VULKAN_ASSET" >> "$GITHUB_OUTPUT"
 
   # Runs alongside the build jobs rather than gating them, and publish waits on
   # the result. These suites were local-only in whisper-cpp-deb at first, which
@@ -173,17 +190,37 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:24.04
+    # Each held in one place, so the compile and compare-upstream.sh read the
+    # same value. The flags are upstream's Linux Vulkan configure line, and the
+    # submodules every one that build compiles. Word splitting passes $ORIGIN
+    # to CMake literally, which upstream achieves by quoting it.
+    env:
+      CONFIGURE_FLAGS: >-
+        -DSD_BUILD_SHARED_LIBS=ON
+        -DSD_VULKAN=ON
+        -DGGML_NATIVE=OFF
+        -DSD_BUILD_SHARED_GGML_LIB=ON
+        -DGGML_BACKEND_DL=ON
+        -DGGML_CPU_ALL_VARIANTS=ON
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+        -DCMAKE_INSTALL_RPATH=$ORIGIN
+      SUBMODULES: >-
+        ggml
+        examples/server/frontend
+        thirdparty/libwebp
+        thirdparty/libwebm
     steps:
       - name: Install build dependencies
         run: |
           # Before checkout, which needs git present or it falls back to a REST
           # download. libvulkan-dev, glslc, and spirv-headers are what
           # upstream's own Linux Vulkan job installs. binutils supplies readelf
-          # for the floor and linkage checks.
+          # for the floor and linkage checks, and curl fetches upstream's
+          # archive for the comparison.
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential git ca-certificates cmake zip unzip xz-utils \
-            binutils libvulkan-dev glslc spirv-headers
+            binutils curl libvulkan-dev glslc spirv-headers
 
       - name: Checkout this repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
@@ -206,27 +243,20 @@ jobs:
           TAG: ${{ needs.check.outputs.tag }}
         run: |
           # The exact tag, so upstream's CMake reads the real commit through git
-          # rev-parse and the smoke test can assert it. Only the four submodules
-          # this build compiles. CUTLASS is large and only the CUDA job uses it.
+          # rev-parse and the smoke test can assert it. Only the submodules this
+          # build compiles. CUTLASS is large and only the CUDA job uses it.
           git clone --depth 1 --branch "$TAG" \
             https://github.com/leejet/stable-diffusion.cpp.git upstream
-          git -C upstream submodule update --init --depth 1 \
-            ggml examples/server/frontend thirdparty/libwebp thirdparty/libwebm
+          # Unquoted, so each path is its own argument.
+          git -C upstream submodule update --init --depth 1 $SUBMODULES
 
       - name: Compile
         working-directory: upstream
         run: |
-          # Upstream's Linux Vulkan configure line, unchanged. Its CMakeLists
-          # defaults the build type to Release.
-          cmake -B build \
-            -DSD_BUILD_SHARED_LIBS=ON \
-            -DSD_VULKAN=ON \
-            -DGGML_NATIVE=OFF \
-            -DSD_BUILD_SHARED_GGML_LIB=ON \
-            -DGGML_BACKEND_DL=ON \
-            -DGGML_CPU_ALL_VARIANTS=ON \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_INSTALL_RPATH='$ORIGIN' 2>&1 | tee ../configure.log
+          # Upstream's Linux Vulkan configure line, which compare-upstream.sh
+          # holds equal to upstream's own. Its CMakeLists defaults the build
+          # type to Release. Unquoted, so each flag is its own argument.
+          cmake -B build $CONFIGURE_FLAGS 2>&1 | tee ../configure.log
           cmake --build build -j"$(nproc)"
 
       - name: Assert the web interface was embedded
@@ -308,6 +338,20 @@ jobs:
           cp upstream/LICENSE upstream/build/bin/stable-diffusion.cpp.txt
           zip -qj archive.zip upstream/build/bin/*
           unzip -l archive.zip
+
+      - name: Compare against upstream's own Linux build
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          ASSET: ${{ needs.check.outputs.vulkan_asset }}
+        run: |
+          # The build here copies upstream's configure line and submodule list,
+          # so a change upstream makes to its own Linux build would otherwise
+          # reach no package and raise no error. Upstream's archive is fetched
+          # only to read its member list. Nothing from it ships.
+          curl -fsSL -o upstream.zip \
+            "https://github.com/$UPSTREAM/releases/download/$TAG/$ASSET"
+          bash scripts/compare-upstream.sh archive.zip upstream.zip upstream \
+            "$CONFIGURE_FLAGS" "$SUBMODULES"
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
