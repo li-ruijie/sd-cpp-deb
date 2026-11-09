@@ -735,20 +735,6 @@ jobs:
           bash scripts/package-base.sh archive.zip "$VERSION" dist
           mv "sd-cpp-cuda_${VERSION}_amd64.deb" dist/
 
-      - name: Install the base package's dependencies
-        env:
-          VERSION: ${{ needs.check.outputs.version }}
-        run: |
-          # The dependencies alone, since the diversion test below installs both
-          # packages with dpkg from nothing, and dpkg installs no dependencies.
-          # The names come from the control file, so they cannot drift from what
-          # the package declares. This image lacks libgomp1, which the compile
-          # job's build-essential used to supply when these tests ran there.
-          deps=$(dpkg-deb -f "dist/sd-cpp_${VERSION}_amd64.deb" Depends \
-            | tr ',' '\n' | sed 's/(.*)//; s/[[:space:]]//g')
-          echo "installing:" $deps
-          apt-get install -y --no-install-recommends $deps
-
       - name: Build a driver stub directory carrying the soname
         run: |
           # NVIDIA ships libcuda.so in its stubs directory, with no libcuda.so.1

@@ -2,11 +2,12 @@
 # Verify an sd-cpp tree runs, that any backend resolves against it, and that the
 # backend was actually selected rather than silently ignored.
 #
-# EXPECT_COMMIT is required. sd-cli reports no version, only a commit, printing
-# "stable-diffusion.cpp version unknown, commit 0a565f2". Asserting a version
-# string would either fail always or, written loosely, assert nothing. The
-# commit from the resolved upstream tag is used instead, which is stronger,
-# since it proves the packaged binary came from the release the resolver chose.
+# EXPECT_COMMIT is required. Upstream's own archives reported no version, only
+# a commit, printing "stable-diffusion.cpp version unknown, commit 0a565f2".
+# Built here from a clone at the tag, git describe supplies one, and sd-cli
+# prints "stable-diffusion.cpp version master-1068-fc350be, commit fc350be".
+# The commit from the resolved upstream tag is asserted either way, since it
+# proves the packaged binary came from the release the resolver chose.
 #
 # EXPECT_BACKEND, when set, names a device prefix that must appear in
 # --list-devices output. This is the assertion that matters most. A backend
