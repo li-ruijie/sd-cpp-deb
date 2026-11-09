@@ -346,6 +346,17 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
         run: bash scripts/package-base.sh archive.zip "$VERSION" dist
 
+      - name: Install the package with apt
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # Through apt rather than dpkg, so trixie's own archive resolves the
+          # declared Depends, which proves trixie can satisfy them. It also
+          # supplies what the smoke test loads, such as libgomp1, which this
+          # image lacks. The ubuntu-latest host carried libgomp1 already, so the
+          # smoke test once passed there without Depends being installed.
+          apt-get install -y --no-install-recommends "./dist/sd-cpp_${VERSION}_amd64.deb"
+
       - name: Smoke test
         env:
           VERSION: ${{ needs.check.outputs.version }}
@@ -422,6 +433,16 @@ jobs:
           # so that capability is necessary and not sufficient, and no property
           # read out of vulkaninfo can stand in for asking ggml itself.
           vulkaninfo --summary 2>&1 | head -40 || true
+
+      - name: Install both packages with apt
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # As in the base job, so trixie resolves the declared Depends of both
+          # and the smoke test finds what they name.
+          apt-get install -y --no-install-recommends \
+            "./dist/sd-cpp_${VERSION}_amd64.deb" \
+            "./dist/sd-cpp-vulkan_${VERSION}_amd64.deb"
 
       - name: Smoke test
         env:
@@ -713,6 +734,20 @@ jobs:
           # smoke test on 2026-11-08.
           bash scripts/package-base.sh archive.zip "$VERSION" dist
           mv "sd-cpp-cuda_${VERSION}_amd64.deb" dist/
+
+      - name: Install the base package's dependencies
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # The dependencies alone, since the diversion test below installs both
+          # packages with dpkg from nothing, and dpkg installs no dependencies.
+          # The names come from the control file, so they cannot drift from what
+          # the package declares. This image lacks libgomp1, which the compile
+          # job's build-essential used to supply when these tests ran there.
+          deps=$(dpkg-deb -f "dist/sd-cpp_${VERSION}_amd64.deb" Depends \
+            | tr ',' '\n' | sed 's/(.*)//; s/[[:space:]]//g')
+          echo "installing:" $deps
+          apt-get install -y --no-install-recommends $deps
 
       - name: Build a driver stub directory carrying the soname
         run: |
