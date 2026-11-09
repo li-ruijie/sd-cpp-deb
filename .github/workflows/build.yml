@@ -431,7 +431,9 @@ jobs:
           # whisper-cpp-deb that Ubuntu 22.04's llvmpipe lacks it. On 24.04
           # lavapipe advertised it and ggml still reported "No devices found",
           # so that capability is necessary and not sufficient, and no property
-          # read out of vulkaninfo can stand in for asking ggml itself.
+          # read out of vulkaninfo can stand in for asking ggml itself. On
+          # trixie, with Mesa 25.0.7 and LLVM 19.1.7, ggml also reports "No
+          # devices found" while having loaded the backend.
           vulkaninfo --summary 2>&1 | head -40 || true
 
       - name: Install both packages with apt
