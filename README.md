@@ -67,6 +67,11 @@ builds on GitHub's `ubuntu-latest`, which moved to 26.04. That excludes Debian t
 Before anything is published, every shipped object is checked against the declared glibc and
 libstdc++ floors. The base and Vulkan packages are then smoke tested on Debian trixie itself.
 
+The base compile copies upstream's configure line and submodule list, so on every build it is also
+compared with upstream's own Linux Vulkan build of the same tag, by archive members, configure
+flags, and submodules. Any difference fails the build until it is adopted here or excluded with a
+recorded reason, so a change upstream makes to its own build cannot drop out without notice.
+
 ## Licensing
 
 Two separate things, which are easy to conflate.
