@@ -102,11 +102,14 @@ jobs:
           # The range must anchor on ^Package: sd-cpp$, since sd-cpp-cuda and
           # sd-cpp-vulkan both begin with that string and an unanchored match
           # would read the wrong stanza.
-          DEPLOYED=$(curl -fsSL \
-            https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages \
-            2>/dev/null \
-            | awk '/^Package: sd-cpp$/,/^$/' \
-            | grep '^Version:' | awk '{print $2}' || true)
+          # A fetch error fails the job. Read as nothing deployed, it rebuilt
+          # 0.0.1117 on 2026-11-23 while Cloudflare challenged the runners. A
+          # package not yet published still builds, as the fetch then succeeds.
+          PACKAGES=$(curl -fsSL --retry 3 \
+            https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages) \
+            || { echo "::error::Could not read the deployed index from apt.leefy.net"; exit 1; }
+          DEPLOYED=$(printf '%s\n' "$PACKAGES" | awk '/^Package: sd-cpp$/,/^$/' \
+            | awk '/^Version:/ {print $2}')
 
           if [ "$VERSION" = "$DEPLOYED" ] && [ "$FORCE" != "true" ]; then
             echo "Version $VERSION already deployed, skipping"
