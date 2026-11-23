@@ -309,7 +309,7 @@ jobs:
           printf '%s\n' "$needed" | sed 's/^/  /'
 
           known='^(libstable-diffusion|libggml|libggml-base|libwebp|libwebpmux'
-          known="$known"'|libwebm|libsharpyuv|libc|libm|libdl|libpthread|librt'
+          known="$known"'|libwebpdemux|libwebm|libsharpyuv|libc|libm|libdl|libpthread|librt'
           known="$known"'|libstdc\+\+|libgcc_s|ld-linux-x86-64|libgomp)\.so'
 
           unexpected=$(printf '%s\n' "$needed" | grep -vE "$known" || true)
