@@ -14,7 +14,7 @@ check() { if [ "$2" = "$3" ]; then ok "$1"; else
             bad "$1"; printf '       expected %s, got %s\n' "$3" "$2"; fi }
 
 # Upstream's shape: two executables, versioned library triplets stored as three
-# byte-identical copies, unversioned objects, and the two licence files. Stored
+# byte-identical copies, unversioned objects, and the four licence files. Stored
 # with bare names rather than a ./ prefix, since upstream's archive is flat and
 # the dedup glob in package-base.sh matches on that.
 make_zip() {
@@ -33,6 +33,8 @@ make_zip() {
     printf 'the library\n'   > "$dir/libstable-diffusion.so"
     printf 'MIT for ggml\n'  > "$dir/ggml.txt"
     printf 'MIT for sd.cpp\n' > "$dir/stable-diffusion.cpp.txt"
+    printf 'BSD for libwebp\n' > "$dir/libwebp.txt"
+    printf 'BSD for libwebm\n' > "$dir/libwebm.txt"
     ( cd "$dir" && zip -q "$out" ./* )
     rm -rf "$dir"
 }
@@ -75,15 +77,29 @@ for p in ./usr/lib/sd-cpp/sd-cli ./usr/lib/sd-cpp/sd-server \
          ./usr/bin/sd-cli ./usr/bin/sd-server \
          ./usr/share/doc/sd-cpp/ggml.txt \
          ./usr/share/doc/sd-cpp/stable-diffusion.cpp.txt \
+         ./usr/share/doc/sd-cpp/libwebp.txt \
+         ./usr/share/doc/sd-cpp/libwebm.txt \
          ./usr/share/doc/sd-cpp/copyright; do
     printf '%s\n' "$contents" | grep -q " $p" \
         && ok "ships $p" || bad "ships $p"
 done
 
 echo "== the licence texts do not stay in the payload directory =="
-printf '%s\n' "$contents" | grep -q './usr/lib/sd-cpp/ggml.txt' \
+printf '%s\n' "$contents" | grep -qE '\./usr/lib/sd-cpp/[^ ]*\.txt' \
     && bad "licence text left in the payload" \
     || ok "licence text moved out of the payload"
+
+echo "== the copyright file assigns the bundled libraries their own terms =="
+# Files: * declares MIT, so without these stanzas the BSD-3-Clause libraries
+# from the libwebp and libwebm submodules would be claimed as MIT.
+copyright=$(dpkg-deb --fsys-tarfile "$deb" | tar -xO ./usr/share/doc/sd-cpp/copyright)
+for want in 'Files: usr/lib/sd-cpp/libwebp\* usr/lib/sd-cpp/libsharpyuv\*' \
+            'Files: usr/lib/sd-cpp/libwebm\*' \
+            'License: BSD-3-Clause' \
+            'as libwebp\.txt' 'as libwebm\.txt'; do
+    printf '%s\n' "$copyright" | grep -q "$want" \
+        && ok "copyright carries '$want'" || bad "copyright carries '$want'"
+done
 
 echo "== /usr/bin entries are relative symlinks =="
 # Relative, so the package relocates and so $ORIGIN resolves through them.
@@ -157,13 +173,19 @@ printf '%s' "$out" | grep -q 'libwebp.so.7' \
     && ok "names the differing file" || bad "names the differing file"
 
 echo "== a missing upstream licence fails the build =="
-zip6="$work/nolicence.zip"
-make_zip "$zip6"
-zip -qd "$zip6" ggml.txt
-out=$("$script" "$zip6" 0.0.829 "$work/out6" 2>&1)
-check "exit status when ggml.txt is absent" "$?" "1"
-printf '%s' "$out" | grep -q 'ggml.txt' \
-    && ok "names the missing licence" || bad "names the missing licence"
+# The paths here are numbered rather than named after the file, since the
+# script prints its output path and a name in it would satisfy the grep below.
+n=0
+for name in stable-diffusion.cpp.txt ggml.txt libwebp.txt libwebm.txt; do
+    n=$((n + 1))
+    zip6="$work/nolicence-$n.zip"
+    make_zip "$zip6"
+    zip -qd "$zip6" "$name"
+    out=$("$script" "$zip6" 0.0.829 "$work/out6-$n" 2>&1)
+    check "exit status when $name is absent" "$?" "1"
+    printf '%s' "$out" | grep -qF "$name" \
+        && ok "names the missing $name" || bad "names the missing $name"
+done
 
 echo "== a missing archive is refused =="
 "$script" "$work/nosuch.zip" 0.0.829 "$work/out7" >/dev/null 2>&1

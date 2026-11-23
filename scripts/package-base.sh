@@ -56,11 +56,12 @@ for name in $backends; do
     rm -f "$libdir/$name"
 done
 
-# The licence texts are documentation rather than payload. Both are required.
-# The build job copies them in from upstream's tree, so a missing one means
-# that tree or the build job changed, and distributing the software without
-# its terms is not an option.
-for name in stable-diffusion.cpp.txt ggml.txt; do
+# The licence texts are documentation rather than payload. All four are
+# required. The build job copies them in from upstream's tree, as upstream's
+# own pack step does from master-1117, so a missing one means that tree or the
+# build job changed, and distributing the software without its terms is not an
+# option. libwebp.txt also covers libsharpyuv, which libwebp's tree builds.
+for name in stable-diffusion.cpp.txt ggml.txt libwebp.txt libwebm.txt; do
     if [ ! -f "$libdir/$name" ]; then
         echo "$0: the archive carries no $name" >&2
         echo "The upstream licence must ship with the package, so this is" >&2
@@ -71,9 +72,9 @@ for name in stable-diffusion.cpp.txt ggml.txt; do
     rm -f "$libdir/$name"
 done
 
-# Debian policy requires /usr/share/doc/<package>/copyright. The two upstream
-# texts sit beside it verbatim, and this file points at them rather than
-# paraphrasing terms.
+# Debian policy requires /usr/share/doc/<package>/copyright. The upstream texts
+# sit beside it verbatim, and this file points at them rather than paraphrasing
+# terms. A later stanza overrides Files: * for the files it matches.
 cat > "$docdir/copyright" <<'COPYRIGHT'
 Upstream-Name: stable-diffusion.cpp
 Source: https://github.com/leejet/stable-diffusion.cpp
@@ -89,6 +90,18 @@ Copyright: Copyright (c) 2023-2024 The ggml authors
 License: MIT
  The full text ships alongside this file as ggml.txt, copied verbatim from
  ggml/LICENSE in the upstream source at the release tag.
+
+Files: usr/lib/sd-cpp/libwebp* usr/lib/sd-cpp/libsharpyuv*
+Copyright: Copyright (c) 2010, Google Inc.
+License: BSD-3-Clause
+ The full text ships alongside this file as libwebp.txt, copied verbatim from
+ thirdparty/libwebp/COPYING in the upstream source at the release tag.
+
+Files: usr/lib/sd-cpp/libwebm*
+Copyright: Copyright (c) 2010, Google Inc.
+License: BSD-3-Clause
+ The full text ships alongside this file as libwebm.txt, copied verbatim from
+ thirdparty/libwebm/LICENSE.TXT in the upstream source at the release tag.
 
 Comment:
  The packaging that produced this .deb is separate work, licensed AGPL-3.0,

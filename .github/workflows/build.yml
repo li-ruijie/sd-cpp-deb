@@ -336,6 +336,8 @@ jobs:
           # folder and not /usr/lib/sd-cpp.
           cp upstream/ggml/LICENSE upstream/build/bin/ggml.txt
           cp upstream/LICENSE upstream/build/bin/stable-diffusion.cpp.txt
+          cp upstream/thirdparty/libwebm/LICENSE.TXT upstream/build/bin/libwebm.txt
+          cp upstream/thirdparty/libwebp/COPYING upstream/build/bin/libwebp.txt
           zip -qj archive.zip upstream/build/bin/*
           unzip -l archive.zip
 
