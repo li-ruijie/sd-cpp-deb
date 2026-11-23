@@ -102,8 +102,12 @@ jobs:
           # The range must anchor on ^Package: sd-cpp$, since sd-cpp-cuda and
           # sd-cpp-vulkan both begin with that string and an unanchored match
           # would read the wrong stanza.
+          #
+          # Read from the Pages address for now, although the repository is
+          # served at apt.leefy.net. Cloudflare answers runners there with a
+          # bot challenge, which this check would read as nothing deployed.
           DEPLOYED=$(curl -fsSL \
-            https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages \
+            https://li-ruijie.github.io/apt/dists/stable/dynamic/binary-amd64/Packages \
             2>/dev/null \
             | awk '/^Package: sd-cpp$/,/^$/' \
             | grep '^Version:' | awk '{print $2}' || true)
