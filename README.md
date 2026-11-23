@@ -80,7 +80,9 @@ The packaging in this repository, meaning the scripts, the workflow, and the tes
 matching the sibling builders and the APT repository itself. See `LICENSE`.
 
 The packaged software is upstream's and stays under upstream's terms, which are MIT for
-stable-diffusion.cpp and for ggml. Those texts ship inside every `sd-cpp` package at
+stable-diffusion.cpp and for ggml, and BSD-3-Clause for libwebp and libwebm, which upstream builds
+from its own submodules into the shared libraries `sd-cpp` ships. Those texts ship inside every
+`sd-cpp` package at
 `/usr/share/doc/sd-cpp/`, taken from the source tree at the release tag rather than copied here, so
 they can never drift from the build they describe. The CUDA build of the library also compiles in
 CUTLASS, under BSD-3-Clause, and SageAttention, under Apache-2.0, and `sd-cpp-cuda` ships both
