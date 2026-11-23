@@ -62,20 +62,25 @@ resolve_object() {
     # llama-cpp-deb was found by reading a passing test's output.
     printf '%s\n' "$resolved"
 
-    # The link that actually matters. A ggml backend declares libggml-base.so.0
-    # and must bind to the base package's copy rather than to some other one on
-    # the machine. This holds whatever else is missing from the environment.
+    # The link that actually matters. A ggml backend declares libggml-base and
+    # must bind to the base package's copy rather than to some other one on the
+    # machine. This holds whatever else is missing from the environment.
+    #
+    # The soname is read from the object rather than written here. ggml moved
+    # from libggml-base.so.0 to libggml-base.so.1 by master-1104, and a literal
+    # .so.0 then failed every backend that had bound correctly.
     #
     # Conditional on the object declaring it, so the check describes the object
     # in front of it rather than assuming. Whether a real backend declares it at
     # all is asserted in the workflow, against the real object, since a
     # stand-in library in the unit tests cannot exercise that path.
-    if readelf -d "$tree/$obj" 2>/dev/null \
-         | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | grep -q '^libggml-base\.so'; then
-        if printf '%s\n' "$resolved" | grep -q "libggml-base.so.0 => $tree/"; then
-            echo "libggml-base.so.0 resolved to the base package"
+    base=$(readelf -d "$tree/$obj" 2>/dev/null \
+             | sed -n 's/.*NEEDED.*\[\(libggml-base\.so[^]]*\)\]/\1/p')
+    if [ -n "$base" ]; then
+        if printf '%s\n' "$resolved" | grep -qF "$base => $tree/"; then
+            echo "$base resolved to the base package"
         else
-            echo "$obj declares libggml-base.so.0 but did not bind to" >&2
+            echo "$obj declares $base but did not bind to" >&2
             echo "the copy in this package:" >&2
             printf '%s\n' "$resolved" | grep 'libggml-base' | sed 's/^/  /' >&2
             status=1
