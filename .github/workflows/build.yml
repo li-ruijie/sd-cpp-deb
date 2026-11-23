@@ -103,7 +103,7 @@ jobs:
           # sd-cpp-vulkan both begin with that string and an unanchored match
           # would read the wrong stanza.
           DEPLOYED=$(curl -fsSL \
-            https://li-ruijie.github.io/apt/dists/stable/dynamic/binary-amd64/Packages \
+            https://apt.leefy.net/dists/stable/dynamic/binary-amd64/Packages \
             2>/dev/null \
             | awk '/^Package: sd-cpp$/,/^$/' \
             | grep '^Version:' | awk '{print $2}' || true)
@@ -908,7 +908,7 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 \
             || gh release create "$TAG" \
                  --title "stable-diffusion.cpp $TAG" \
-                 --notes "Packaged as $VERSION for https://li-ruijie.github.io/apt/"
+                 --notes "Packaged as $VERSION for https://apt.leefy.net/"
           # --clobber rather than deleting the release first. Deleting left a
           # window, roughly the length of the upload, in which a failure lost
           # both the old release and the new one, and took the tag with them.

@@ -1,7 +1,7 @@
 # stable-diffusion.cpp Debian packages
 
 Builds `sd-cpp`, `sd-cpp-vulkan`, and `sd-cpp-cuda` for
-[li-ruijie/apt](https://li-ruijie.github.io/apt/), from
+[li-ruijie/apt](https://apt.leefy.net/), from
 [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
 
 `sd-cpp` carries `sd-cli` and `sd-server`, compiled from upstream source at each release tag.
